@@ -14,12 +14,12 @@ says which release it runs and how that installs.
 
 ## The OfficeEnv version
 
-The server runs OfficeEnv 1.10.0. OfficeEnv is not published yet, so the server's `pyproject.toml`
+The server runs OfficeEnv 1.11.0. OfficeEnv is not published yet, so the server's `pyproject.toml`
 and `uv.lock` list only its public dependencies, and OfficeEnv installs apart, from NVIDIA's
 internal GitLab, into the venv Gym builds from them:
 
 ```bash
-uv pip install --python resources_servers/officeenv/.venv/bin/python "officeenv @ git+${OFFICEENV_GIT_URL}@v1.10.0"
+uv pip install --python resources_servers/officeenv/.venv/bin/python "officeenv @ git+${OFFICEENV_GIT_URL}@v1.11.0"
 ```
 
 `OFFICEENV_GIT_URL` is that repository's git URL: `ssh://...` with an SSH key, or `https://...`
@@ -52,7 +52,7 @@ every server, so that tree shadows the installed release, and `/verify` reports 
 ```json
 {"responses_create_params": {"input": [{"role": "system", "content": "..."}, {"role": "user", "content": "..."}], "tools": [...]},
  "officeenv": {"task_id": "...", "seed": 1, "actor": {...}, "apps": {...}, "exposure": {"mode": "api_search"}, "checks": [...]},
- "officeenv_version": "1.10.0",
+ "officeenv_version": "1.11.0",
  "task_id": "..."}
 ```
 
@@ -74,14 +74,13 @@ officeenv emit $E/renewal_escalation.json $E/schedule_kickoff.json $E/vendor_ter
   $E/ticket_triage.json $E/sprint_handover.json -o data/example.jsonl
 ```
 
-The example rows are emitted by OfficeEnv 1.10.0; against 1.9.0's, only their version stamp and
-`schedule_kickoff`'s Google Calendar tools changed (`send_updates`, described as it now behaves,
-and taken by `delete_event` and `update_event` too). The example rollouts were collected on
-2026-10-28 with `azure/openai/gpt-5.5` against OfficeEnv 1.9.0, through this server and the simple
-agent (concurrency two). All five score 1.0. Every error the metrics count is an authored fault (a
-transient error, rate limits) or a tool mistake the model recovered from. They are integration
-smokes, not a benchmark: `schedule_kickoff` scores 0.75 whenever the model books its slot over a
-meeting injected during the episode (`gcalendar.no_conflicts`), as it did on earlier runs.
+The example rows are emitted by OfficeEnv 1.11.0; against 1.10.0's, only their version stamp
+changed. The example rollouts were collected on 2026-10-28 with `azure/openai/gpt-5.5` against
+OfficeEnv 1.9.0, through this server and the simple agent (concurrency two). All five score 1.0.
+Every error the metrics count is an authored fault (a transient error, rate limits) or a tool
+mistake the model recovered from. They are integration smokes, not a benchmark: `schedule_kickoff`
+scores 0.75 whenever the model books its slot over a meeting injected during the episode
+(`gcalendar.no_conflicts`), as it did on earlier runs.
 
 Training and validation sets are not committed.
 
@@ -357,7 +356,7 @@ for Pi). `/verify` adds `sandbox_commands`, `sandbox_commands_refused` and
 `sandbox_endpoint_calls`.
 
 Rows come from OfficeEnv's sandbox example tasks: `sandbox/prepare_rows.py` writes
-`data/sandbox_pilot.jsonl` with the OfficeEnv it imports (its sandbox tasks, nine in 1.10.0). A
+`data/sandbox_pilot.jsonl` with the OfficeEnv it imports (its sandbox tasks, nine in 1.11.0). A
 row holds a system and a user message and the TaskSpec, and no tool list, since the harness takes
 its tools from the MCP grant. `--exposure cli` or `--exposure api_search` writes the same tasks in
 that exposure, with a prompt that says how the apps are reached, to
