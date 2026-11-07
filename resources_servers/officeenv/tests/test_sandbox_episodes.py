@@ -2989,7 +2989,8 @@ def test_a_harness_image_holds_the_runtime_its_adapter_looks_for(
     folder = re.search(r"runtime=(\S+)", block).group(1).replace("$version", f"{{self.config.{version_of}}}")
     default = re.escape(f'f"{folder}"')
     source = (AGENTS / agent / "app.py").read_text()
-    assert re.search(rf"runtime = (?:self\.config\.sandbox_runtime_dir or )?{default}", source)
+    # The assignment may wrap in parentheses over lines, as OpenClaw's does since Gym #5557.
+    assert re.search(rf"runtime = \(?\s*(?:self\.config\.sandbox_runtime_dir or )?{default}", source)
     if harness == "opencode":
         runtime_module = (AGENTS / agent / "runtime.py").read_text()
         configured = re.search(r'^OPENCODE_VERSION = "([^"]+)"', runtime_module, re.MULTILINE).group(1)
