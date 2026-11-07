@@ -1153,7 +1153,6 @@ def test_a_download_saves_the_file_in_the_workspace_and_answers_with_its_path(sa
         assert sandbox.files[revision["savedTo"]] == BOOK
         exported = call("gdrive_export_file", file_id="F_DOC", mime_type="text/plain")
         assert exported["content"] == POLICY and exported["savedTo"] == "/workspace/drive/F_DOC/Travel policy.txt"
-        assert sandbox.commands.count("mkdir -p /workspace/drive/F_BOOK") == 1  # a file's folder is made once
 
         result = client.post("/verify", json=VERIFY_BODY, cookies=seeded.cookies).json()
         assert result["sandbox_files_saved"] == 5.0 and result["sandbox_uploads_refused"] == 0.0
@@ -1274,6 +1273,26 @@ def test_a_save_the_workspace_is_in_the_way_of_fails_the_call_and_is_graded(sand
         sandboxes.refusing = ("test ! -d",)
         got = client.post("/gdrive_download_file", json={"file_id": "F_BOOK"}, cookies=seeded.cookies)
         assert got.status_code == 502 and "ledger.xlsx in the workspace: a folder is there" in got.text
+        verified = client.post("/verify", json=VERIFY_BODY, cookies=seeded.cookies).json()
+        assert not verified["mask_sample"] and verified["failure_kind"] is None, verified
+
+
+def test_a_file_put_where_a_download_folder_was_fails_the_next_save_and_is_graded(sandboxes) -> None:
+    """A folder a download made is made again for the next save into it: the model may have removed it (it comes
+    back), or put a file in its place. Then the call fails (502) as the workspace's doing, and the episode is graded,
+    not masked as if the provider had failed."""
+    with mcp_client(make_server()) as client:
+        seeded, _, _ = seed_with_content(client)
+        (sandbox,) = sandboxes.started
+        for _ in range(2):
+            got = client.post("/gdrive_download_file", json={"file_id": "F_BOOK"}, cookies=seeded.cookies)
+            assert got.status_code == 200, got.text
+        assert sandbox.commands.count("mkdir -p /workspace/drive/F_BOOK") == 2
+        # A file where the folder was: mkdir refuses, and the provider's own copy would fail.
+        sandboxes.refusing, sandboxes.fail_on = ("mkdir",), "upload"
+        got = client.post("/gdrive_download_file", json={"file_id": "F_BOOK"}, cookies=seeded.cookies)
+        assert got.status_code == 502 and "ledger.xlsx in the workspace: its folder could not be made" in got.text
+        sandboxes.refusing, sandboxes.fail_on = (), None
         verified = client.post("/verify", json=VERIFY_BODY, cookies=seeded.cookies).json()
         assert not verified["mask_sample"] and verified["failure_kind"] is None, verified
 

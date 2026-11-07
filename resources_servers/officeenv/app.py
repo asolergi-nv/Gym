@@ -1612,7 +1612,6 @@ class _Episode:
     files_attached: int = 0
     bytes_attached: int = 0
     saves: list[tuple[str, bytes]] = field(default_factory=list)  # (path, bytes) the current call saved
-    folders: set[str] = field(default_factory=set)  # folders made in the sandbox for them
     attached: dict[str, bytes | str] = field(default_factory=dict)  # the current call's attached files, or why not
     direct: bool = False  # a file API call is under way: its content moves as it is
     direct_status: int | None = None  # the HTTP status of the error that call met, if any
@@ -2422,17 +2421,17 @@ class OfficeEnvResourcesServer(SimpleResourcesServer):
         saves, episode.saves = episode.saves, []
         for target, data in saves:
             try:
+                # Made for every save, even into a folder made before: the model may have removed it, or put a file
+                # in its place, and the provider's copy would then fail as if the provider had.
                 folder = posixpath.dirname(target)
-                if folder not in episode.folders:
-                    made = await episode.sandbox.exec(f"mkdir -p {shlex.quote(folder)}", cwd="/", timeout_s=60)
-                    if made.error_type is not None:
-                        raise RuntimeError(f"mkdir: {made.error_type} {(made.stderr or '')[-300:]}")
-                    if made.return_code != 0:  # the workspace is in the way: a file where a folder goes
-                        raise HTTPException(
-                            status_code=502,
-                            detail=f"Could not save {target} in the workspace: its folder could not be made",
-                        )
-                    episode.folders.add(folder)
+                made = await episode.sandbox.exec(f"mkdir -p {shlex.quote(folder)}", cwd="/", timeout_s=60)
+                if made.error_type is not None:
+                    raise RuntimeError(f"mkdir: {made.error_type} {(made.stderr or '')[-300:]}")
+                if made.return_code != 0:  # the workspace is in the way: a file where a folder goes
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"Could not save {target} in the workspace: its folder could not be made",
+                    )
                 # a folder at the file's path would take the copy inside it, and savedTo would name the folder
                 free = await episode.sandbox.exec(f"test ! -d {shlex.quote(target)}", cwd="/", timeout_s=60)
                 if free.error_type is not None:
