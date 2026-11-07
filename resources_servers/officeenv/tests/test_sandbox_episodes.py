@@ -450,6 +450,34 @@ def test_a_sandbox_that_fails_to_start_leaves_no_world_and_no_sandbox(sandboxes,
         assert client.post("/seed_session", json=seed_body()).status_code == 200  # the seed can be retried
 
 
+def test_a_failed_seed_whose_stop_fails_leaves_its_sandbox_to_shutdown(sandboxes, monkeypatch, caplog) -> None:
+    """The provider cannot describe the started sandbox, and its stop fails too: the seed's own error answers, no
+    world or token is left, a retried seed lends a new sandbox, and shutdown stops the one the failed seed left."""
+    sandboxes.fail_on = "serialize"
+    stop = FakeSandbox.stop
+    refused: list[FakeSandbox] = []
+
+    async def stop_refusing_once(sandbox: FakeSandbox) -> None:
+        if not refused:
+            refused.append(sandbox)
+            raise RuntimeError("the provider could not stop the sandbox")
+        await stop(sandbox)
+
+    monkeypatch.setattr(FakeSandbox, "stop", stop_refusing_once)
+    server = make_server()
+    with caplog.at_level("ERROR"):
+        with mcp_client(server) as client:
+            with pytest.raises(RuntimeError, match="the provider cannot describe the sandbox"):
+                client.post("/seed_session", json=seed_body())
+            assert len(server.service.store) == 0 and not server._episodes and not server._tokens
+            assert sandboxes.stopped == [] and "after its seed failed" in caplog.text
+            sandboxes.fail_on = None
+            assert client.post("/seed_session", json=seed_body()).status_code == 200  # a new sandbox is lent
+        # leaving the client shuts the server down
+    assert refused == [sandboxes.started[0]] and set(sandboxes.stopped) == set(sandboxes.started)
+    assert not server._unstopped and "Shutdown left" not in caplog.text
+
+
 def test_sandbox_episodes_keep_the_resources_session_contract(sandboxes, monkeypatch) -> None:
     # The contract's client calls from "testclient", which is no address; the caller check is tested below.
     monkeypatch.setattr(officeenv_app, "is_trusted_caller", lambda host, **_: True)

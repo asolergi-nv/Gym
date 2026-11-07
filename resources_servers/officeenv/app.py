@@ -1653,6 +1653,8 @@ class OfficeEnvResourcesServer(SimpleResourcesServer):
     _locks: weakref.WeakValueDictionary[str, asyncio.Lock] = PrivateAttr(default_factory=weakref.WeakValueDictionary)
     _shutting_down: bool = PrivateAttr(default=False)
     _starting: set[str] = PrivateAttr(default_factory=set)  # sessions whose sandbox's create is in flight
+    # Sandboxes of failed seeds whose stop failed too, by session: no episode holds them, and shutdown stops them.
+    _unstopped: list[tuple[str, AsyncSandbox]] = PrivateAttr(default_factory=list)
     _seeding: asyncio.Semaphore = PrivateAttr(default_factory=lambda: asyncio.Semaphore(1))  # a seed's turn
     _seeds_queued: int = PrivateAttr(default=0)  # seeds waiting for or taking their turn
     _session_secret: str | None = PrivateAttr(default=None)
@@ -1942,7 +1944,13 @@ class OfficeEnvResourcesServer(SimpleResourcesServer):
                 workdir=config.workdir,
             )
         except BaseException:
-            await sandbox.stop()  # also closes the provider of a sandbox that never started
+            try:
+                await sandbox.stop()  # also closes the provider of a sandbox that never started
+            except Exception:  # the seed's own error answers; the sandbox is kept for shutdown to stop
+                LOGGER.exception(
+                    "Failed to stop the sandbox of OfficeEnv session %s after its seed failed", session_id
+                )
+                self._unstopped.append((session_id, sandbox))
             raise
         finally:
             self._starting.discard(session_id)
@@ -1968,8 +1976,9 @@ class OfficeEnvResourcesServer(SimpleResourcesServer):
         """Stop the sandboxes of open episodes, all at once and within the time Gym's run command leaves its servers
         once it signals them to stop (``server_shutdown_timeout_seconds``, then it kills them): a sandbox left running
         stays on the cell until its TTL. A seed still starting one holds its episode's lock, so its stop waits for the
-        seed, and a seed that comes later starts none. The sandboxes not stopped by the deadline are logged for a
-        reaper, the lent ones apart from those whose create is still in flight."""
+        seed, and a seed that comes later starts none. The sandboxes of failed seeds whose stop failed too are stopped
+        alike. The sandboxes not stopped by the deadline are logged for a reaper: the lent ones, those of failed seeds,
+        and those whose create is still in flight, apart."""
         self._shutting_down = True
         grace = get_global_config_dict().get(SERVER_SHUTDOWN_TIMEOUT_KEY)
         budget = max(0.5, (1.0 if grace is None else float(grace)) - SHUTDOWN_MARGIN_S)
@@ -1986,26 +1995,40 @@ class OfficeEnvResourcesServer(SimpleResourcesServer):
                     except Exception:
                         LOGGER.exception("Failed to stop the sandbox of OfficeEnv session %s", session_id)
 
+        async def stop_unstopped(left: tuple[str, AsyncSandbox]) -> None:
+            async with at_once:
+                try:
+                    await left[1].stop()
+                except Exception:
+                    LOGGER.exception("Failed to stop the sandbox of OfficeEnv session %s's failed seed", left[0])
+                else:
+                    self._unstopped.remove(left)
+
         # a seed awaiting its lock has no episode yet
         stops = [asyncio.ensure_future(stop(session_id)) for session_id in set(self._episodes) | set(self._locks)]
+        stops += [asyncio.ensure_future(stop_unstopped(left)) for left in list(self._unstopped)]
         if not stops:
             return
         _, pending = await asyncio.wait(stops, timeout=budget)
         for task in pending:
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
-        # A lent sandbox whose stop failed or was cut at the deadline, and one whose create is still in flight (its seed
-        # holds the episode's lock, so the stop was cut waiting for it)
+        # A lent sandbox whose stop failed or was cut at the deadline, one a failed seed left, and one whose create is
+        # still in flight (its seed holds the episode's lock, so the stop was cut waiting for it)
         lent = sorted(session_id for session_id, episode in self._episodes.items() if episode.sandbox is not None)
+        failed = sorted(session_id for session_id, _ in self._unstopped)
         starting = sorted(self._starting)  # the provider deletes a cancelled create while this process lives
-        if lent or starting:
+        if lent or failed or starting:
             LOGGER.error(
                 "Shutdown left %d OfficeEnv sandboxes running after %.1f s; a reaper must stop them. %d lent, "
-                "sessions: %s. %d still starting, their creates in flight, sessions: %s",
-                len(lent) + len(starting),
+                "sessions: %s. %d of failed seeds, sessions: %s. %d still starting, their creates in flight, "
+                "sessions: %s",
+                len(lent) + len(failed) + len(starting),
                 budget,
                 len(lent),
                 _listed(lent),
+                len(failed),
+                _listed(failed),
                 len(starting),
                 _listed(starting),
             )
