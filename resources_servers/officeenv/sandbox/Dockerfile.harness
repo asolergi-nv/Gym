@@ -3,9 +3,10 @@
 #
 # One episode image per harness, for training mixes whose sandboxes have no internet: each target is an episode image
 # (BASE, sandbox/Dockerfile.documents' image by default) with one harness's runtime where that harness's Gym adapter
-# looks for it at session start, so the adapter finds it and downloads nothing. sandbox/harness_runtime.sh runs the
-# adapters' own installers as the adapters do. Build from the Gym checkout's root (Dockerfile.harness.dockerignore
-# sends only the installers and that script):
+# looks for it at session start, so the adapter finds it and downloads nothing (but OpenCode, which still installs its
+# plugin dependencies from the npm registry; the server's README, "Images per harness"). sandbox/harness_runtime.sh
+# runs the adapters' own installers as the adapters do. Build from the Gym checkout's root
+# (Dockerfile.harness.dockerignore sends only the installers and that script):
 #
 #   docker build -f resources_servers/officeenv/sandbox/Dockerfile.harness --target pi \
 #     -t officeenv-sandbox:documents-pi .

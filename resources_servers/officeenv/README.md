@@ -292,7 +292,11 @@ fetch Node and their package), which a sandbox without the internet cannot do.
 `sandbox/Dockerfile.harness` builds one image per harness on the documents image: each target
 runs the harness adapter's own installer as the adapter runs it (`sandbox/harness_runtime.sh`),
 so the runtime is where the adapter looks for it at session start and the adapter downloads
-nothing. Build from the Gym checkout's root (`Dockerfile.harness.dockerignore` sends only the
+nothing. OpenCode is the exception: at every start it also installs its plugin dependencies from
+the npm registry (about 63 MB), which its image does not hold. Without the internet, it needs the
+adapter's plugin-dependency bundle as well (`sandbox_plugin_dependencies_path` and
+`sandbox_plugin_dependencies_sha256`; the OpenCode adapter's README, "Pinned offline runtime
+bundle"). Build from the Gym checkout's root (`Dockerfile.harness.dockerignore` sends only the
 installers and that script):
 
 ```bash
