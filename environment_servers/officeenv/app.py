@@ -99,7 +99,14 @@ class OfficeEnvEnvironmentServer(SingleAgentTurnLegacyEnvironmentServer):
             )
             outputs.extend(response.output)
             usage = accumulate_response_usage(usage, response.usage)
-            if response.status != "completed" or not any(item.type == "function_call" for item in response.output):
+            # A step that did not complete ends the episode, as a step without a tool call does. A reply may omit its
+            # status (LiteLLM's model server sends none, and the simple agent passes that on), so only a status other
+            # than completed, or truncation, counts as not completing.
+            if (
+                response.status not in (None, "completed")
+                or response.incomplete_details is not None
+                or not any(item.type == "function_call" for item in response.output)
+            ):
                 break
             if await self._task_ended(handles):
                 break

@@ -91,8 +91,9 @@ def _answer_step(step: int) -> dict[str, Any]:
     }
 
 
-def _reply(step: dict[str, Any], status: str = "completed") -> dict[str, Any]:
-    return {
+def _reply(step: dict[str, Any], status: str | None = "completed", **fields: Any) -> dict[str, Any]:
+    """The agent's reply to one activation; ``status=None`` leaves the status out, as LiteLLM's model server does."""
+    reply = {
         "id": "response",
         "created_at": 0,
         "model": "model",
@@ -100,10 +101,11 @@ def _reply(step: dict[str, Any], status: str = "completed") -> dict[str, Any]:
         "tool_choice": "auto",
         "parallel_tool_calls": True,
         "tools": [],
-        "status": status,
         "usage": USAGE,
         **step,
+        **fields,
     }
+    return reply if status is None else {**reply, "status": status}
 
 
 class _Client(ServerClient):
@@ -261,6 +263,30 @@ async def test_the_episode_ends_at_a_step_that_did_not_complete() -> None:
 
     assert client.activations == 1
     assert _verified_response(client)["status"] == "incomplete"
+
+
+async def test_a_reply_without_a_status_goes_on_to_the_next_step() -> None:
+    # LiteLLM's model server answers without a status, and the simple agent passes the omission on.
+    server, client = _server([_reply(_tool_step(1), status=None), _reply(_answer_step(2), status=None)])
+
+    await server.run_legacy(ROW)
+
+    assert client.activations == 2
+    assert client.paths().count(f"GET {TASK_STATE_PATH}") == 1
+    response = _verified_response(client)
+    assert [item["type"] for item in response["output"]] == ["function_call", "function_call_output", "message"]
+    assert (response["usage"]["input_tokens"], response["usage"]["output_tokens"]) == (20, 8)
+
+
+@pytest.mark.parametrize("status", [None, "completed"])
+async def test_a_truncated_reply_ends_the_episode_whatever_its_status(status: str | None) -> None:
+    truncated = _reply(_tool_step(1), status=status, incomplete_details={"reason": "max_output_tokens"})
+    server, client = _server([truncated, _reply(_tool_step(2))])
+
+    await server.run_legacy(ROW)
+
+    assert client.activations == 1
+    assert client.paths().count(f"GET {TASK_STATE_PATH}") == 0
 
 
 async def test_the_episode_ends_after_max_steps() -> None:
