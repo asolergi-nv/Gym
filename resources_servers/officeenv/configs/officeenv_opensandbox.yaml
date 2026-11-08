@@ -7,7 +7,9 @@
 #     --config responses_api_models/vllm_model/configs/vllm_model_for_training.yaml ...
 #
 # Credentials: `sandbox.opensandbox.connection` in env.yaml (domain, protocol, api_key, tls_verify), or
-# OPENSANDBOX_DOMAIN and OPENSANDBOX_API_KEY in the environment.
+# OPENSANDBOX_DOMAIN and OPENSANDBOX_API_KEY in the environment. The provider speaks http unless the domain carries
+# a scheme or `protocol` says otherwise, so a server that serves only https, as cell-3 does, needs one of them:
+# OPENSANDBOX_DOMAIN=https://<host>, or `protocol: https`.
 config_paths:
   - resources_servers/officeenv/configs/officeenv_sandbox.yaml
   - nemo_gym/sandbox/providers/opensandbox/configs/opensandbox.yaml
