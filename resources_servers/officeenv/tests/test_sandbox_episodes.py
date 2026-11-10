@@ -576,6 +576,31 @@ def test_an_upload_streaming_in_when_verification_begins_writes_nothing(sandboxe
         assert listed.status_code == 200 and "late.csv" not in listed.text
 
 
+@pytest.mark.parametrize("close_tools_on_task_end", [True, False])
+def test_with_tools_closed_at_task_end_the_file_api_closes_too(sandboxes, close_tools_on_task_end: bool) -> None:
+    """Once a call has ended the task, close_tools_on_task_end refuses the file API as it refuses the tools, so a
+    file uploaded after complete_task cannot make the task pass. Without the setting the file API stays open."""
+    server = make_server(close_tools_on_task_end=close_tools_on_task_end)
+    with mcp_client(server) as client:
+        seeded = client.post("/seed_session", json=seed_body())
+        auth = file_auth(server)
+        ended = client.post("/user_complete_task", json={"answer": "done"}, cookies=seeded.cookies)
+        assert ended.status_code == 200, ended.text
+        created = client.post(
+            "/v1/files", params={"app": "gdrive", "name": "totals.csv"}, content=TOTALS.encode(), headers=auth
+        )
+        replaced = client.put("/v1/files/gdrive/F_LEDGER", content=b"vendor,total\n", headers=auth)
+        downloaded = client.get("/v1/files/gdrive/F_LEDGER", headers=auth)
+        answers = [created.status_code, replaced.status_code, downloaded.status_code]
+        verified = client.post("/verify", json=VERIFY_BODY, cookies=seeded.cookies)
+    if close_tools_on_task_end:
+        assert answers == [409, 409, 409] and "its files are closed" in created.text, created.text
+        assert verified.json()["reward"] == 0.0, verified.text  # the late upload made nothing pass
+    else:
+        assert answers == [200, 200, 200], (created.text, replaced.text)
+        assert verified.json()["reward"] == 1.0, verified.text
+
+
 def test_a_failed_stop_before_grading_still_grades_and_close_stops_it(sandboxes) -> None:
     server = make_server()
     with mcp_client(server) as client:

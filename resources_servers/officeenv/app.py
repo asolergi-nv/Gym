@@ -344,9 +344,9 @@ class OfficeEnvResourcesServerConfig(BaseResourcesServerConfig):
     close_tools_on_task_end: bool = Field(
         default=False,
         description=(
-            "Refuse a tool call on any surface (409) once a call has returned with the episode's task ended (GET "
-            "/task_state), so the calls a turn makes after the one that ended it change nothing; the Environment "
-            "Server that ends episodes there sets it"
+            "Refuse a tool call on any surface, and in sandbox mode the file API too (409), once a call has returned "
+            "with the episode's task ended (GET /task_state), so the calls a turn makes after the one that ended it "
+            "change nothing; the Environment Server that ends episodes there sets it"
         ),
     )
 
@@ -2341,11 +2341,13 @@ class OfficeEnvResourcesServer(SimpleResourcesServer):
             raise HTTPException(status_code=401, detail="Missing or invalid bearer token")
         return session_id
 
-    def _refuse_once_grading(self, session_id: str) -> None:
-        """Refuse a file API write once the episode's verification has begun. The token is revoked then, but an
-        upload it admitted earlier may still be streaming in, and must not change what is graded."""
+    def _refuse_once_closed(self, session_id: str) -> None:
+        """Refuse a file API call once the episode's files are closed, as its tools are: when its verification has
+        begun (the token is revoked then, but an upload it admitted earlier may still be streaming in, and must not
+        change what is graded), and with ``close_tools_on_task_end`` once a call has returned with its task ended."""
         episode = self._episodes.get(session_id)
-        if episode is not None and episode.grading:
+        grading = episode is not None and episode.grading
+        if grading or (self.config.close_tools_on_task_end and self._task_ends.get(session_id, False)):
             raise HTTPException(status_code=409, detail="The task has ended: its files are closed")
 
     def _file_op(
@@ -2506,7 +2508,9 @@ class OfficeEnvResourcesServer(SimpleResourcesServer):
             return {"content_base64": base64.b64encode(data).decode("ascii")}
 
     async def download_file(self, request: Request, app_name: str, file_id: str) -> Response:
-        body = self._file_call(self._file_session(request), app_name, "download", file_id=file_id)
+        session_id = self._file_session(request)
+        self._refuse_once_closed(session_id)
+        body = self._file_call(session_id, app_name, "download", file_id=file_id)
         content, encoded = body.get("content"), body.get("contentBase64", body.get("content_base64"))
         if isinstance(content, str):  # a text file: its UTF-8 bytes
             data, media_type = content.encode("utf-8"), "text/plain"
@@ -2524,9 +2528,9 @@ class OfficeEnvResourcesServer(SimpleResourcesServer):
         self, request: Request, app: str, name: str, parent: str | None = None, mime_type: str | None = None
     ) -> JSONResponse:
         session_id = self._file_session(request)
-        self._refuse_once_grading(session_id)
+        self._refuse_once_closed(session_id)
         content = await self._content_args(request)
-        self._refuse_once_grading(session_id)  # verification may have begun while the body streamed in
+        self._refuse_once_closed(session_id)  # verification may have begun while the body streamed in
         return JSONResponse(
             self._file_call(session_id, app, "create", content, name=name, parent=parent, mime_type=mime_type)
         )
@@ -2535,9 +2539,9 @@ class OfficeEnvResourcesServer(SimpleResourcesServer):
         self, request: Request, app_name: str, file_id: str, mime_type: str | None = None
     ) -> JSONResponse:
         session_id = self._file_session(request)
-        self._refuse_once_grading(session_id)
+        self._refuse_once_closed(session_id)
         content = await self._content_args(request)
-        self._refuse_once_grading(session_id)  # verification may have begun while the body streamed in
+        self._refuse_once_closed(session_id)  # verification may have begun while the body streamed in
         return JSONResponse(
             self._file_call(session_id, app_name, "update", content, file_id=file_id, mime_type=mime_type)
         )
