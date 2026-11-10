@@ -656,6 +656,44 @@ def test_shutdown_and_retiring_wait_for_a_seed_still_starting_its_sandbox(sandbo
     assert len(sandboxes.started) == 1 and sandboxes.stopped == sandboxes.started
 
 
+def test_shutdown_stops_the_sandbox_a_seed_failing_meanwhile_could_not_stop(sandboxes, monkeypatch, caplog) -> None:
+    """A seed still starting its sandbox when shutdown begins fails, and so does its own stop of that sandbox:
+    shutdown, which waited for the seed's lock, stops it on a second try and leaves nothing for a reaper."""
+    server = make_server()
+    start, stop = FakeSandbox.start, FakeSandbox.stop
+    refused: list[FakeSandbox] = []
+
+    async def stop_refusing_once(sandbox: FakeSandbox) -> None:
+        if not refused:
+            refused.append(sandbox)
+            raise RuntimeError("the provider could not stop the sandbox")
+        await stop(sandbox)
+
+    async def scenario() -> None:
+        starting, go = asyncio.Event(), asyncio.Event()
+
+        async def slow_failing_start(sandbox: FakeSandbox, spec) -> None:
+            starting.set()
+            await go.wait()
+            await start(sandbox, spec)
+            raise RuntimeError("the provider lost the sandbox")
+
+        monkeypatch.setattr(FakeSandbox, "start", slow_failing_start)
+        monkeypatch.setattr(FakeSandbox, "stop", stop_refusing_once)
+        seed = asyncio.create_task(server._seed_sandboxed_episode(SimpleNamespace(session={}), seed_request()))
+        await starting.wait()
+        stopping = asyncio.create_task(server.shutdown())
+        await asyncio.sleep(0)  # shutdown has begun, and waits for the seed's lock
+        go.set()
+        failed, stopped = await asyncio.gather(seed, stopping, return_exceptions=True)
+        assert isinstance(failed, RuntimeError) and stopped is None, (failed, stopped)
+
+    with caplog.at_level("ERROR"):
+        asyncio.run(scenario())
+    assert refused == sandboxes.started and sandboxes.stopped == sandboxes.started  # the second stop was shutdown's
+    assert not server._unstopped and "Shutdown left" not in caplog.text
+
+
 def test_shutdown_stops_every_lent_sandbox_at_once_within_its_grace(sandboxes, monkeypatch) -> None:
     """A job's end gives the servers server_shutdown_timeout_seconds before they are killed; stopped one after another,
     a collection's worth of sandboxes (64 in a training smoke) would outlast it and stay on the cell until their TTL."""

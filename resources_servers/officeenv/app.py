@@ -1977,23 +1977,28 @@ class OfficeEnvResourcesServer(SimpleResourcesServer):
         once it signals them to stop (``server_shutdown_timeout_seconds``, then it kills them): a sandbox left running
         stays on the cell until its TTL. A seed still starting one holds its episode's lock, so its stop waits for the
         seed, and a seed that comes later starts none. The sandboxes of failed seeds whose stop failed too are stopped
-        alike. The sandboxes not stopped by the deadline are logged for a reaper: the lent ones, those of failed seeds,
-        and those whose create is still in flight, apart."""
+        alike, the one a seed still starting leaves as it fails among them. The sandboxes not stopped by the
+        deadline are logged for a reaper: the lent ones, those of failed seeds, and those whose create is still in
+        flight, apart."""
         self._shutting_down = True
         grace = get_global_config_dict().get(SERVER_SHUTDOWN_TIMEOUT_KEY)
         budget = max(0.5, (1.0 if grace is None else float(grace)) - SHUTDOWN_MARGIN_S)
         at_once = asyncio.Semaphore(SHUTDOWN_STOPS_AT_ONCE)
+        tried = list(self._unstopped)  # the failed seeds' sandboxes this shutdown stops, known by identity
 
         async def stop(session_id: str) -> None:
             async with self._locks.setdefault(session_id, asyncio.Lock()):
                 episode = self._episodes.get(session_id)
-                if episode is None:
-                    return
-                async with at_once:
-                    try:
-                        await self._release(episode)
-                    except Exception:
-                        LOGGER.exception("Failed to stop the sandbox of OfficeEnv session %s", session_id)
+                if episode is not None:
+                    async with at_once:
+                        try:
+                            await self._release(episode)
+                        except Exception:
+                            LOGGER.exception("Failed to stop the sandbox of OfficeEnv session %s", session_id)
+            # The seed this stop waited for may have failed meanwhile, and failed to stop its sandbox too
+            late = [left for left in self._unstopped if left[0] == session_id and all(left is not t for t in tried)]
+            tried.extend(late)
+            await asyncio.gather(*(stop_unstopped(left) for left in late))
 
         async def stop_unstopped(left: tuple[str, AsyncSandbox]) -> None:
             async with at_once:
@@ -2006,7 +2011,7 @@ class OfficeEnvResourcesServer(SimpleResourcesServer):
 
         # a seed awaiting its lock has no episode yet
         stops = [asyncio.ensure_future(stop(session_id)) for session_id in set(self._episodes) | set(self._locks)]
-        stops += [asyncio.ensure_future(stop_unstopped(left)) for left in list(self._unstopped)]
+        stops += [asyncio.ensure_future(stop_unstopped(left)) for left in list(tried)]
         if not stops:
             return
         _, pending = await asyncio.wait(stops, timeout=budget)
