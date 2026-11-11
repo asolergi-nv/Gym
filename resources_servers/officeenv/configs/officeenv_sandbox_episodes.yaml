@@ -26,9 +26,9 @@ oe:
       sandbox_config:
         image: officeenv-sandbox:pilot
         ttl_s: 7200
-        # File content (Google Drive, Box, SharePoint, OneDrive) stays out of the model's context: a download saves
-        # the file in the workspace (/workspace/<app folder>/<file id>/<name>) and answers with its path, the content
-        # inline only for text up to this many bytes; an upload that pastes binary content or longer text is refused
-        # with the file API command. Gmail's attachments too: get_attachment saves one in the workspace, and a
-        # message attaches a workspace file by its path. null answers and takes content in full.
+        # File content stays out of the model's context (OfficeEnv's workspace mode): a download is saved in the
+        # workspace and answered with its path, the content inline only for text up to this many bytes; an upload or
+        # an attachment names a workspace file by its path, and one that pastes binary content or longer text is
+        # refused with the path to use and the file API command. null takes text of up to 20 MB inline; other files
+        # still move through the workspace.
         inline_file_bytes: 8192

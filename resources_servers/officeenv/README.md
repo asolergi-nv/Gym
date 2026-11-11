@@ -177,57 +177,49 @@ with no MCP tools. Each episode also:
    Server admit no more (`max_concurrent_episodes` follows it), and the rest wait there, before
    their seed, for up to a day (`queue_timeout_seconds`). mini-SWE and Terminus 2 run every
    episode they are given;
-2. moves file content between the workspace and the file apps (Google Drive, Box, SharePoint,
-   OneDrive) without passing it through the model: the sandbox gets `COMPANY_API_URL` and
-   `COMPANY_API_TOKEN`, in its environment and in `/etc/company-api.env` for a harness whose
-   shell does not inherit the sandbox's environment (Codex starts its shell with `PATH`, `HOME`,
-   the locale and the XDG folders alone; the apps' commands read the file, and the guide says
-   `. /etc/company-api.env`), and `README.md` in the workspace documents the file API for the
-   episode's file apps (`GET`/`PUT /v1/files/{app}/{file_id}`,
-   `POST /v1/files?app=&name=&parent=&mime_type=`). Files and folders are named by id: the server
-   reads what an app's op also wants (SharePoint's library, folder and name) from the world.
-   SharePoint uploads need a folder (`parent`); `mime_type` is Drive's. Text and binary files (an
-   XLSX workbook, say) move byte for byte; uploads are limited to 20 MB; an app's error comes back
-   under its own HTTP status (a missing file is 404, a name Box already holds 409);
-3. keeps their content out of the conversation on the apps' own tools too
-   (`sandbox_config.inline_file_bytes`, 8192 by default):
-   - a download (Drive's `download_file`, `export_file` and `get_revision`, Box's
-     `get_file_content`, SharePoint's `get_item_content`, OneDrive's `get_content` and
-     `get_version_content`) saves the file in the workspace at `<folder>/<file id>/<name>`
-     (`drive/`, `box/`, `sharepoint/`, `onedrive/`; a Drive revision under
-     `revisions/<version>/`, a Box or OneDrive version under `versions/<version>/`, an export with
-     its type's extension), mode 644, and answers with `savedTo` and `savedBytes`. The answer
-     carries the content as well only for a text file of at most `inline_file_bytes` bytes; a
-     longer text gets its first 2,000 characters as `preview`, a binary file nothing but its path;
-   - the uploads (Drive's `create_file` and `update_file`, Box's `upload_file` and
-     `upload_file_version`, SharePoint's `upload_content`, OneDrive's `upload_file`) refuse binary
-     content, and text over `inline_file_bytes` bytes, pasted into the call
-     (`upload_from_workspace`), with the file API command that sends the file instead;
-   - Gmail's attachments move through the workspace too, since Gmail has no file API:
-     `get_attachment` saves one at `gmail/<message id>/<attachment id>/<name>` and answers as the
-     downloads above, and an attachment of `send_message`, `create_draft` or `update_draft` may
-     name a workspace file by its path (`{"path": "/workspace/totals.xlsx", "filename"?,
-     "mimeType"?}`; a relative path is in the workspace), or as a bare string that writes a path
-     or names a file the workspace holds. The server reads that file from the sandbox before the
-     call runs and the call carries its bytes. Each path is checked in the sandbox first (`stat`,
-     which follows no final link): only a regular file of at most 20 MB is downloaded, nothing
-     when a message names more than 20 files or more than 25 MB together, and the copy is checked
-     again, since `docker cp` copies a link as a link, which the server would read on its own
-     host. A download that fails attaches nothing. Pasted binary content, and text over `inline_file_bytes` bytes, are
-     refused (`upload_from_workspace`), and so is an attachment that names a file without its
-     content (`attach_from_workspace`), each with the attachment that names the workspace file;
-   - these tools are described as they behave here, in place of OfficeEnv's words
-     (`contentBase64`, `content_base64`), and so are the uploads' `content` and
-     `content_base64` parameters and Gmail's `attachments`; `README.md` says the same.
-     `/verify` reports `sandbox_files_saved`, `sandbox_bytes_saved`,
-     `sandbox_uploads_refused`, `sandbox_files_attached` and `sandbox_bytes_attached`, over all
-     five apps.
+2. moves file content between the workspace and the file apps (those of the episode's apps that
+   OfficeEnv gives a file API: Google Drive, Box, SharePoint, OneDrive) without passing it through
+   the model: the sandbox gets `COMPANY_API_URL` and `COMPANY_API_TOKEN`, in its environment and in
+   `/etc/company-api.env` for a harness whose shell does not inherit the sandbox's environment
+   (Codex starts its shell with `PATH`, `HOME`, the locale and the XDG folders alone; the apps'
+   commands read the file, and the guide says `. /etc/company-api.env`), and `README.md` in the
+   workspace documents the file API for the episode's file apps (`GET`/`PUT
+   /v1/files/{app}/{file_id}`, `POST /v1/files?app=&name=&parent=&mime_type=`), with OfficeEnv's
+   note on each. The routes are OfficeEnv's file call (`EpisodeService.file_download`,
+   `file_create`, `file_replace`), the agent's own action, which maps files and folders named by
+   id onto each app's ops. Text and binary files (an XLSX workbook, say) move byte for byte;
+   uploads are limited to 20 MB; an app's error comes back under its own HTTP status and body (a
+   missing file is 404, a name Box already holds 409, an app the task makes unavailable 503);
+3. keeps their content out of the conversation on the apps' own calls too: every sandboxed
+   episode runs in OfficeEnv's workspace mode from its seed (`officeenv.files`,
+   `EpisodeService.enable_workspace`), with the workspace's folder, an inline limit
+   (`sandbox_config.inline_file_bytes`, 8192 by default; `null` takes text of up to 20 MB inline,
+   while other files still move through the workspace) and the file API's commands for a refused
+   upload. OfficeEnv decides, for every app that declares where its content crosses its API, what
+   the mode does, and describes it in every surface's own words:
+   - a download is saved in the workspace and answered with `savedTo` and `savedBytes`, the
+     content as well only for a text file of at most the inline limit (a longer text gets its
+     start as `preview`); the server writes each saved file into the sandbox before it answers
+     (`Reply.workspace_writes`), mode 644;
+   - an upload takes a workspace file by its path (`content_path`), and an attachment by its
+     `path`; pasted binary content, and text over the limit, are refused
+     (`upload_from_workspace`), naming the path form and the file API command for the call's
+     target. The server reads each file a call names from the sandbox before the call runs
+     (`EpisodeService.workspace_reads`). Each path is checked in the sandbox first (`stat`, which
+     follows no final link): only a regular file of at most 20 MB is downloaded, nothing when a
+     call names more than 20 files or more than 25 MB together (or more than the op's own caps,
+     when stricter), and the copy is checked again, since `docker cp` copies a link as a link,
+     which the server would read on its own host. A download that fails reads nothing;
+   - `/verify` reports `sandbox_files_saved` and `sandbox_bytes_saved` (the writes that landed),
+     and `sandbox_uploads_refused`, `sandbox_files_attached`, `sandbox_bytes_attached`,
+     `sandbox_files_uploaded` and `sandbox_bytes_uploaded` (OfficeEnv's
+     `EpisodeService.workspace_stats`), and passes on OfficeEnv's trace of the mode
+     (`officeenv_workspace`); with `workspace_trace_store` set, the bytes the server hands an
+     episode are kept there, so the trace replays without a sandbox.
 
-   The file API, short text, calls without content and episodes without a sandbox are unchanged;
-   `inline_file_bytes: null` restores full answers. The server wraps the episode's OfficeEnv
-   session for this (`ContentInWorkspace`), so OfficeEnv itself is unchanged. A model that pulls a
-   workbook through the tool reads its bytes as base64 on every later request, and one that copies
-   file content by hand gets it wrong: in earlier pilots, models did both;
+   Episodes without a sandbox are unchanged. A model that pulls a workbook through the tool reads
+   its bytes as base64 on every later request, and one that copies file content by hand gets it
+   wrong: in earlier pilots, models did both;
 4. ends when Pi's run ends: `finish_tool_names: [user_complete_task]`, its timeout, or the model
    stopping. `/verify` first closes the episode's tools and file API and stops its sandbox, then
    grades the world as for any row: a process the harness left running in the background can act
