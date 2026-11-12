@@ -17,10 +17,10 @@ from environment_servers.single_agent_turn_legacy.app import SingleAgentTurnLega
 from nemo_gym.config import GlobalConfigDictParser, GlobalConfigDictParserConfig
 from nemo_gym.sandbox import create_provider, resolve_provider_config
 from nemo_gym.sandbox.providers.opensandbox import provider as opensandbox_provider
-from resources_servers.officeenv.app import OfficeEnvSandboxConfig
+from resources_servers.officeenv_sandbox.app import OfficeEnvSandboxConfig
 
 
-CONFIGS = "resources_servers/officeenv/configs"
+CONFIGS = "resources_servers/officeenv_sandbox/configs"
 DOCKER = "nemo_gym/sandbox/providers/docker/configs/docker.yaml"
 # The configs of the harnesses that run at most `concurrency` episodes at once, with the provider each runs on
 # (officeenv_opensandbox.yaml is Pi's on OpenSandbox). mini-SWE and Terminus 2 run every episode they are given.
@@ -104,7 +104,7 @@ def test_a_sandbox_create_outlasts_its_request_and_readiness_wait(monkeypatch, c
     # starting within its bounds, deletes it and starts again, and the provider warns.
     config = _compose(monkeypatch, CAPPED["pi-opensandbox"][0])
     monkeypatch.setattr(opensandbox_provider, "_BUDGET_WARNINGS", set())
-    server = config["oe"]["resources_servers"]["officeenv"]
+    server = config["oe"]["resources_servers"]["officeenv_sandbox"]
     sandbox = OfficeEnvSandboxConfig(**server["sandbox_config"])
     spec = sandbox.spec(server["sandbox_provider"], image=sandbox.image, workdir=sandbox.workdir, named_configs=config)
     provider = create_provider(resolve_provider_config(server["sandbox_provider"], config))

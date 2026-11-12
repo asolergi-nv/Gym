@@ -11,7 +11,7 @@ server_shutdown_timeout_seconds: 30
 
 oe:
   resources_servers:
-    officeenv:
+    officeenv_sandbox:
       entrypoint: app.py
       domain: agent
       verified: false

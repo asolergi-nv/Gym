@@ -5,7 +5,7 @@
 # config and `--agent miniswe_sandboxed_agent`. mini-SWE installs its Python packages from PyPI in each sandbox at
 # session start (Gym uploads its Python and uv), so its sandboxes need the internet, or an image with them installed.
 config_paths:
-  - resources_servers/officeenv/configs/officeenv_sandbox_episodes.yaml
+  - resources_servers/officeenv_sandbox/configs/officeenv_sandbox_episodes.yaml
   - responses_api_agents/miniswe_sandboxed_agent/configs/miniswe_sandboxed_agent.yaml
   - environment_servers/single_agent_turn_legacy/configs/single_agent_turn_legacy.yaml
 

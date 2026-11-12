@@ -8,7 +8,7 @@
 # runs the adapters' own installers as the adapters do. Build from the Gym checkout's root
 # (Dockerfile.harness.dockerignore sends only the installers and that script):
 #
-#   docker build -f resources_servers/officeenv/sandbox/Dockerfile.harness --target pi \
+#   docker build -f resources_servers/officeenv_sandbox/sandbox/Dockerfile.harness --target pi \
 #     -t officeenv-sandbox:documents-pi .
 #
 # Targets: pi, codex, openclaw, opencode, terminus-2, each at its adapter's configured version unless a build argument
@@ -16,23 +16,23 @@
 # network, where the adapter's installer must find the runtime and the harness must start:
 #
 #   docker run --rm --network none -v "$PWD:/gym:ro" officeenv-sandbox:documents-pi \
-#     bash /gym/resources_servers/officeenv/sandbox/harness_runtime.sh pi /gym/responses_api_agents
+#     bash /gym/resources_servers/officeenv_sandbox/sandbox/harness_runtime.sh pi /gym/responses_api_agents
 ARG BASE=officeenv-sandbox:documents
 
 FROM ${BASE} AS pi
 ARG PI_VERSION
 RUN --mount=type=bind,target=/gym PI_VERSION=$PI_VERSION \
-    bash /gym/resources_servers/officeenv/sandbox/harness_runtime.sh pi /gym/responses_api_agents
+    bash /gym/resources_servers/officeenv_sandbox/sandbox/harness_runtime.sh pi /gym/responses_api_agents
 
 FROM ${BASE} AS codex
 ARG CODEX_VERSION
 RUN --mount=type=bind,target=/gym CODEX_VERSION=$CODEX_VERSION \
-    bash /gym/resources_servers/officeenv/sandbox/harness_runtime.sh codex /gym/responses_api_agents
+    bash /gym/resources_servers/officeenv_sandbox/sandbox/harness_runtime.sh codex /gym/responses_api_agents
 
 FROM ${BASE} AS openclaw
 ARG OPENCLAW_VERSION
 RUN --mount=type=bind,target=/gym OPENCLAW_VERSION=$OPENCLAW_VERSION \
-    bash /gym/resources_servers/officeenv/sandbox/harness_runtime.sh openclaw /gym/responses_api_agents
+    bash /gym/resources_servers/officeenv_sandbox/sandbox/harness_runtime.sh openclaw /gym/responses_api_agents
 
 FROM ${BASE} AS opencode
 ARG OPENCODE_VERSION
@@ -41,8 +41,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ripgrep \
     && rm -rf /var/lib/apt/lists/*
 RUN --mount=type=bind,target=/gym OPENCODE_VERSION=$OPENCODE_VERSION \
-    bash /gym/resources_servers/officeenv/sandbox/harness_runtime.sh opencode /gym/responses_api_agents
+    bash /gym/resources_servers/officeenv_sandbox/sandbox/harness_runtime.sh opencode /gym/responses_api_agents
 
 FROM ${BASE} AS terminus-2
 RUN --mount=type=bind,target=/gym \
-    bash /gym/resources_servers/officeenv/sandbox/harness_runtime.sh terminus-2 /gym/responses_api_agents
+    bash /gym/resources_servers/officeenv_sandbox/sandbox/harness_runtime.sh terminus-2 /gym/responses_api_agents

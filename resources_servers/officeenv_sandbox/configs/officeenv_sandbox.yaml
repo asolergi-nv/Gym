@@ -4,10 +4,10 @@
 # must reach both this resources server and the model server, so bind them to an address the containers can reach:
 #
 #   gym env start \
-#     --config resources_servers/officeenv/configs/officeenv_sandbox.yaml \
+#     --config resources_servers/officeenv_sandbox/configs/officeenv_sandbox.yaml \
 #     --config nemo_gym/sandbox/providers/docker/configs/docker.yaml \
 #     --model-type inference_provider --model <model> --model-url <url> '+policy_api_key=...' \
-#     ++oe.resources_servers.officeenv.host=<host address> \
+#     ++oe.resources_servers.officeenv_sandbox.host=<host address> \
 #     ++policy_model.responses_api_models.inference_provider.host=<host address>
 #
 # Rows: data/sandbox_pilot.jsonl (sandbox/prepare_rows.py), whose prompts name the tools as Pi lists
@@ -16,14 +16,16 @@
 # and commands' rows (cli) with no MCP tools at all:
 # ++single_agent_turn_legacy.environment_servers.single_agent_turn_legacy.resources_tool_transports=[].
 config_paths:
-  - resources_servers/officeenv/configs/officeenv_sandbox_episodes.yaml
+  - resources_servers/officeenv_sandbox/configs/officeenv_sandbox_episodes.yaml
   - responses_api_agents/pi_agent/configs/pi_agent.yaml
   - environment_servers/single_agent_turn_legacy/configs/single_agent_turn_legacy.yaml
 
 oe:
   resources_servers:
-    officeenv:
+    officeenv_sandbox:
+      domain: agent
       verified: false
+      description: OfficeEnv episodes lent to sandboxed harnesses (MCP tools, commands or endpoints, a sandbox per episode, a file API)
       sandbox_config:
         # How Pi names the MCP tools (`<mcp_server_name>_<tool>`), for the workspace guide
         mcp_tool_prefix: company_
@@ -32,6 +34,10 @@ pi_agent:
   responses_api_agents:
     pi_agent:
       finish_tool_names: [user_complete_task]
+      datasets:
+      - name: example
+        type: example
+        jsonl_fpath: resources_servers/officeenv_sandbox/data/example.jsonl
       timeout: 1800
       # Pi's default, set here for the admission cap below to follow.
       concurrency: 8

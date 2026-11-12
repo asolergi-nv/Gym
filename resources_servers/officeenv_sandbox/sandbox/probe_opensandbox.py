@@ -10,7 +10,7 @@ Run it on the node type that will host Gym's servers, with the cell's credential
 (OPENSANDBOX_DOMAIN, OPENSANDBOX_API_KEY, OPENSANDBOX_PROTOCOL), never on the command line:
 
     set -a; . <file with the cell's OPENSANDBOX_* variables>; set +a
-    NEMO_GYM_RUN_ID=oe-probe-$(date +%s) .venv/bin/python resources_servers/officeenv/sandbox/probe_opensandbox.py
+    NEMO_GYM_RUN_ID=oe-probe-$(date +%s) .venv/bin/python resources_servers/officeenv_sandbox/sandbox/probe_opensandbox.py
 
 Leftover sandboxes carry the run id; `nemo_gym/sandbox/providers/opensandbox/cleanup_sandboxes.py` removes them.
 """
@@ -39,7 +39,7 @@ if TYPE_CHECKING:
 
 ROOT = Path(__file__).resolve().parents[3]
 PROVIDER_CONFIG = ROOT / "nemo_gym/sandbox/providers/opensandbox/configs/opensandbox.yaml"
-OFFICEENV_CONFIG = ROOT / "resources_servers/officeenv/configs/officeenv_opensandbox.yaml"
+OFFICEENV_CONFIG = ROOT / "resources_servers/officeenv_sandbox/configs/officeenv_opensandbox.yaml"
 PI_INSTALLER = ROOT / "responses_api_agents/pi_agent/install_pi_runtime.sh"
 EGRESS = ["https://pypi.org/simple/", "https://registry.npmjs.org/", "https://nodejs.org/dist/index.json"]
 REPLY = b"officeenv-probe-ok"
@@ -78,7 +78,7 @@ def sandbox_config() -> SandboxConfig:
     from nemo_gym.sandbox import SandboxConfig
 
     oe = OmegaConf.to_container(OmegaConf.load(OFFICEENV_CONFIG)["oe"], resolve=True)
-    settings = oe["resources_servers"]["officeenv"]["sandbox_config"]
+    settings = oe["resources_servers"]["officeenv_sandbox"]["sandbox_config"]
     return SandboxConfig(
         **{key: settings[key] for key in ("ttl_s", "resources", "env", "metadata") if key in settings}
     )
@@ -104,7 +104,7 @@ async def probe(args: argparse.Namespace) -> dict:
     config = sandbox_config()
     if args.ttl_s:
         config = config.model_copy(update={"ttl_s": args.ttl_s})
-    image = OmegaConf.load(OFFICEENV_CONFIG)["oe"]["resources_servers"]["officeenv"]["sandbox_config"]["image"]
+    image = OmegaConf.load(OFFICEENV_CONFIG)["oe"]["resources_servers"]["officeenv_sandbox"]["sandbox_config"]["image"]
     spec = config.spec(
         "sandbox",
         image=image,

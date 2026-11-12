@@ -11,7 +11,7 @@
 # mcp__company__ (how Codex names the MCP tools); one tool name, google_workspace_admin_list_licenses_for_product_and_sku,
 # is then longer than the 64 characters a function name may have.
 config_paths:
-  - resources_servers/officeenv/configs/officeenv_sandbox_episodes.yaml
+  - resources_servers/officeenv_sandbox/configs/officeenv_sandbox_episodes.yaml
   - responses_api_agents/codex_agent/configs/codex_agent.yaml
   - environment_servers/single_agent_turn_legacy/configs/single_agent_turn_legacy.yaml
 

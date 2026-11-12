@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Sandbox mode: each Environment Server episode borrows a sandbox, reaches OfficeEnv's tools over MCP and
+"""The sandboxed OfficeEnv server: each Environment Server episode borrows a sandbox, reaches OfficeEnv's tools over MCP and
 moves file content over the episode's file API, and the server refuses callers that are not Gym's.
 Sandboxes come from a fake provider, so these tests start no container. Environment Server episodes
-without a sandbox and the MCP exposure itself are tested in test_app.py. What each app does with file
+without a sandbox and the MCP exposure itself are tested in resources_servers/officeenv/tests/test_app.py. What each app does with file
 content in workspace mode is OfficeEnv's, and its tests' (tests/test_workspace.py); these test the
 server's side of the mode, with Google Drive as the example app and one Gmail attachment flow: the
 routes, the reads and writes of the sandbox's files with their checks, the refusals and the metrics."""
@@ -54,8 +54,13 @@ from nemo_gym.server_runtime import (
     maybe_auto_expose,
 )
 from nemo_gym.server_runtime.base_resources_server import mcp_session_token_serializer
-from resources_servers.officeenv import app as officeenv_app
 from resources_servers.officeenv.app import (
+    OfficeEnvResourcesServer,
+    OfficeEnvResourcesServerConfig,
+    tools_exposure_catalog,
+)
+from resources_servers.officeenv_sandbox import app as sandbox_app
+from resources_servers.officeenv_sandbox.app import (
     APP_COMMAND_PATH,
     APP_COMMAND_SOURCE,
     CLI_USER_AGENT,
@@ -69,15 +74,14 @@ from resources_servers.officeenv.app import (
     TOOL_SETS,
     UNLIMITED_INLINE_FILE_BYTES,
     UPLOAD_HINT,
-    OfficeEnvResourcesServer,
-    OfficeEnvResourcesServerConfig,
     OfficeEnvSandboxConfig,
+    OfficeEnvSandboxResourcesServer,
+    OfficeEnvSandboxResourcesServerConfig,
     ToolSet,
     api_credentials,
     egress_urls,
     is_trusted_caller,
     relay_ports,
-    tools_exposure_catalog,
     with_http_calls,
     workspace_guide,
 )
@@ -281,25 +285,26 @@ def sandboxes(monkeypatch) -> type[FakeSandbox]:
     FakeSandbox.started, FakeSandbox.stopped, FakeSandbox.fail_on, FakeSandbox.on_stop = [], [], None, None
     FakeSandbox.refusing, FakeSandbox.on_download, FakeSandbox.links, FakeSandbox.folders = (), None, {}, set()
     FakeSandbox.kinds, FakeSandbox.partial = {}, {}
-    monkeypatch.setattr(officeenv_app, "AsyncSandbox", FakeSandbox)
-    monkeypatch.setattr(officeenv_app, "get_global_config_dict", lambda: {"sandbox": {"docker": {}}})
+    monkeypatch.setattr(sandbox_app, "AsyncSandbox", FakeSandbox)
+    monkeypatch.setattr(sandbox_app, "get_global_config_dict", lambda: {"sandbox": {"docker": {}}})
     return FakeSandbox
 
 
-def make_server(**config: object) -> OfficeEnvResourcesServer:
-    """A server in sandbox mode unless ``sandbox_provider=None``."""
-    settings = {
-        "host": "10.0.0.1",
-        "port": 8080,
-        "entrypoint": "",
-        "name": "oe",
-        "expose_tools_over_mcp": True,
-        "sandbox_provider": "sandbox",
-        "sandbox_config": IMAGE,
-        **config,
-    }
+SETTINGS = {"host": "10.0.0.1", "port": 8080, "entrypoint": "", "name": "oe", "expose_tools_over_mcp": True}
+
+
+def make_server(**config: object) -> OfficeEnvSandboxResourcesServer:
+    """The sandboxed server, on the fixture's provider with the pilot image unless ``config`` says otherwise."""
+    settings = {**SETTINGS, "sandbox_provider": "sandbox", "sandbox_config": IMAGE, **config}
+    return OfficeEnvSandboxResourcesServer(
+        config=OfficeEnvSandboxResourcesServerConfig(**settings), server_client=MagicMock(spec=ServerClient)
+    )
+
+
+def make_base_server(**config: object) -> OfficeEnvResourcesServer:
+    """The OfficeEnv server the sandboxed one subclasses, which lends no sandbox."""
     return OfficeEnvResourcesServer(
-        config=OfficeEnvResourcesServerConfig(**settings), server_client=MagicMock(spec=ServerClient)
+        config=OfficeEnvResourcesServerConfig(**SETTINGS, **config), server_client=MagicMock(spec=ServerClient)
     )
 
 
@@ -352,7 +357,7 @@ def file_auth(server: OfficeEnvResourcesServer, session_id: str = "rs-1") -> dic
 def configured_mcp_settings() -> dict:
     """The MCP settings the sandbox configs give the server (configs/officeenv_sandbox_episodes.yaml)."""
     episodes = SANDBOX_CONFIG.with_name("officeenv_sandbox_episodes.yaml")
-    settings = yaml.safe_load(episodes.read_text())["oe"]["resources_servers"]["officeenv"]
+    settings = yaml.safe_load(episodes.read_text())["oe"]["resources_servers"]["officeenv_sandbox"]
     return {key: settings[key] for key in ("mcp_server_name", "mcp_bearer_token")}
 
 
@@ -427,7 +432,7 @@ def test_a_refused_seed_starts_no_sandbox(sandboxes) -> None:
 def test_an_api_search_episode_whose_documentation_tool_mcp_does_not_serve_is_refused(sandboxes, monkeypatch) -> None:
     """An OfficeEnv naming the documentation tool otherwise than MCP serves it (DOCS_TOOLS read from an OfficeEnv
     that lists no names) would leave the episode no documentation: its seed is refused before a sandbox starts."""
-    monkeypatch.setattr(officeenv_app, "SEARCH_TOOLS", officeenv_app.SEARCH_TOOLS[:1])  # api_search alone
+    monkeypatch.setattr(sandbox_app, "SEARCH_TOOLS", sandbox_app.SEARCH_TOOLS[:1])  # api_search alone
     server = make_server()
     with mcp_client(server) as client:
         refused = client.post("/seed_session", json=seed_body(in_surface(SPEC, "api_search")))
@@ -479,7 +484,7 @@ def test_a_failed_seed_whose_stop_fails_leaves_its_sandbox_to_shutdown(sandboxes
 
 def test_sandbox_episodes_keep_the_resources_session_contract(sandboxes, monkeypatch) -> None:
     # The contract's client calls from "testclient", which is no address; the caller check is tested below.
-    monkeypatch.setattr(officeenv_app, "is_trusted_caller", lambda host, **_: True)
+    monkeypatch.setattr(sandbox_app, "is_trusted_caller", lambda host, **_: True)
     server = make_server()
 
     def holds_state(session_id: str) -> bool:  # the episode, which holds its sandbox, or its world
@@ -555,14 +560,14 @@ def test_an_upload_streaming_in_when_verification_begins_writes_nothing(sandboxe
     with mcp_client(server) as client:
         seeded = client.post("/seed_session", json=seed_body())
         auth = file_auth(server)
-        read_body = OfficeEnvResourcesServer._content_args
+        read_body = OfficeEnvSandboxResourcesServer._content_args
 
         async def body_then_verification(request):
             args = await read_body(request)
             server._episodes["rs-1"].grading = True  # as /verify sets it, while this body streamed in
             return args
 
-        monkeypatch.setattr(OfficeEnvResourcesServer, "_content_args", staticmethod(body_then_verification))
+        monkeypatch.setattr(OfficeEnvSandboxResourcesServer, "_content_args", staticmethod(body_then_verification))
         replaced = client.put("/v1/files/gdrive/F_LEDGER", content=b"vendor,total\n", headers=auth)
         server._episodes["rs-1"].grading = False
         created = client.post(
@@ -696,7 +701,7 @@ def test_shutdown_stops_the_sandbox_a_seed_failing_meanwhile_could_not_stop(sand
 def test_shutdown_stops_every_lent_sandbox_at_once_within_its_grace(sandboxes, monkeypatch) -> None:
     """A job's end gives the servers server_shutdown_timeout_seconds before they are killed; stopped one after another,
     a collection's worth of sandboxes (64 in a training smoke) would outlast it and stay on the cell until their TTL."""
-    monkeypatch.setattr(officeenv_app, "get_global_config_dict", lambda: GRACE_OF_3_S)  # a stop budget of 1 s
+    monkeypatch.setattr(sandbox_app, "get_global_config_dict", lambda: GRACE_OF_3_S)  # a stop budget of 1 s
     server = make_server()
     stop = FakeSandbox.stop
 
@@ -720,7 +725,7 @@ def test_shutdown_stops_every_lent_sandbox_at_once_within_its_grace(sandboxes, m
 
 
 def test_shutdown_ends_at_its_deadline_and_logs_the_sandboxes_left(sandboxes, monkeypatch, caplog) -> None:
-    monkeypatch.setattr(officeenv_app, "get_global_config_dict", lambda: GRACE_OF_3_S)  # a stop budget of 1 s
+    monkeypatch.setattr(sandbox_app, "get_global_config_dict", lambda: GRACE_OF_3_S)  # a stop budget of 1 s
     server = make_server()
     stop = FakeSandbox.stop
 
@@ -746,7 +751,7 @@ def test_shutdown_ends_at_its_deadline_and_logs_the_sandboxes_left(sandboxes, mo
 def test_shutdown_names_the_creates_still_in_flight_at_its_deadline_apart(sandboxes, monkeypatch, caplog) -> None:
     """A sandbox whose create is still in flight at the deadline is counted and named apart from the lent ones, so a
     reaper's count can be checked against the line."""
-    monkeypatch.setattr(officeenv_app, "get_global_config_dict", lambda: GRACE_OF_3_S)  # a stop budget of 1 s
+    monkeypatch.setattr(sandbox_app, "get_global_config_dict", lambda: GRACE_OF_3_S)  # a stop budget of 1 s
     server = make_server()
     start, stop = FakeSandbox.start, FakeSandbox.stop
 
@@ -924,12 +929,12 @@ def test_each_seed_logs_its_place_its_wait_and_its_build_time(sandboxes, monkeyp
     async def scenario() -> None:
         await asyncio.gather(*seed_concurrently(server, 3))
 
-    with caplog.at_level(logging.INFO, logger=officeenv_app.SEED_LOGGER.name):
+    with caplog.at_level(logging.INFO, logger=sandbox_app.SEED_LOGGER.name):
         asyncio.run(scenario())
     pattern = re.compile(r"Seed of OfficeEnv session (rs-\d): (\d+) ahead, waited \d+\.\d\d s, built in \d+\.\d\d s")
-    lines = [record.getMessage() for record in caplog.records if record.name == officeenv_app.SEED_LOGGER.name]
+    lines = [record.getMessage() for record in caplog.records if record.name == sandbox_app.SEED_LOGGER.name]
     assert [pattern.fullmatch(line).groups() for line in lines] == [("rs-0", "0"), ("rs-1", "1"), ("rs-2", "2")]
-    assert officeenv_app.SEED_LOGGER.handlers and officeenv_app.SEED_LOGGER.level == logging.INFO
+    assert sandbox_app.SEED_LOGGER.handlers and sandbox_app.SEED_LOGGER.level == logging.INFO
 
 
 def test_an_episodes_lock_is_kept_only_while_a_request_holds_it(sandboxes) -> None:
@@ -956,7 +961,7 @@ def test_a_host_relay_starts_in_the_sandbox_before_it_is_lent(sandboxes, monkeyp
         "sandbox": {"docker": {}},
         "policy_model": {"responses_api_models": {"inference_provider": {"port": 18173}}},
     }
-    monkeypatch.setattr(officeenv_app, "get_global_config_dict", lambda: named)
+    monkeypatch.setattr(sandbox_app, "get_global_config_dict", lambda: named)
     server = make_server(host="127.0.0.1", sandbox_config={**IMAGE, "host_relay": "host.lima.internal"})
     with mcp_client(server) as client:
         assert client.post("/seed_session", json=seed_body()).status_code == 200
@@ -978,7 +983,7 @@ OPENSANDBOX_NAMED = {
 
 
 def test_a_sandbox_without_the_internet_reaches_only_this_server_and_the_model_servers(sandboxes, monkeypatch) -> None:
-    monkeypatch.setattr(officeenv_app, "get_global_config_dict", lambda: OPENSANDBOX_NAMED)
+    monkeypatch.setattr(sandbox_app, "get_global_config_dict", lambda: OPENSANDBOX_NAMED)
     with mcp_client(make_server(sandbox_config={**IMAGE, "block_internet": True})) as client:
         assert client.post("/seed_session", json=seed_body()).status_code == 200
     guide = sandboxes.started[0].spec.files["/workspace/README.md"]
@@ -1008,7 +1013,7 @@ def test_blocking_the_internet_needs_opensandbox_a_reachable_server_and_one_poli
     with mcp_client(make_server(sandbox_config=blocked)) as client:  # the fixture's provider is Docker
         with pytest.raises(ValueError, match="OpenSandbox"):
             client.post("/seed_session", json=seed_body())
-    monkeypatch.setattr(officeenv_app, "get_global_config_dict", lambda: OPENSANDBOX_NAMED)
+    monkeypatch.setattr(sandbox_app, "get_global_config_dict", lambda: OPENSANDBOX_NAMED)
     with mcp_client(make_server(host="127.0.0.1", sandbox_config=blocked)) as client:
         with pytest.raises(ValueError, match="sandbox-reachable"):
             client.post("/seed_session", json=seed_body())
@@ -1164,7 +1169,7 @@ def test_the_file_api_refuses_other_tokens_apps_and_oversized_uploads(sandboxes,
         assert client.get("/v1/files/box/F_LEDGER", headers=auth).status_code == 404
         missing = client.get("/v1/files/gdrive/F_MISSING", headers=auth)
         assert missing.status_code == 404 and "error" in missing.text
-        monkeypatch.setattr(officeenv_app, "MAX_UPLOAD_BYTES", 8)
+        monkeypatch.setattr(sandbox_app, "MAX_UPLOAD_BYTES", 8)
         too_big = client.post(
             "/v1/files", params={"app": "gdrive", "name": "x.bin"}, content=b"\xff" * 9, headers=auth
         )
@@ -1476,10 +1481,10 @@ def test_a_saved_download_whose_mode_cannot_be_set_is_answered(sandboxes) -> Non
 
 
 def test_without_a_sandbox_file_content_moves_as_before(sandboxes) -> None:
-    """An episode without a sandbox, and a plain row's seed even in sandbox mode, answer and take file content in
-    full, with OfficeEnv's descriptions."""
+    """An episode of the OfficeEnv server, and a plain row's seed on the sandboxed one, answer and take file content
+    in full, with OfficeEnv's descriptions."""
     catalog = tools_exposure_catalog()
-    with mcp_client(make_server(sandbox_provider=None)) as client:
+    with mcp_client(make_base_server()) as client:
         seeded, call, described = seed_with_content(client)
         book = call("gdrive_download_file", file_id="F_BOOK")
         assert book["contentBase64"] == BOOK_B64 and "savedTo" not in book
@@ -1582,7 +1587,7 @@ def test_an_attachment_is_read_only_from_a_regular_file_of_the_sandbox(sandboxes
     secret = tmp_path / "host.txt"
     secret.write_text("a file of the host\n")
     sandboxes.links, sandboxes.folders = {"/workspace/link.txt": str(secret)}, {"/workspace/out"}
-    monkeypatch.setattr(officeenv_app, "MAX_UPLOAD_BYTES", 8)  # the episode's Workspace takes it at its seed
+    monkeypatch.setattr(sandbox_app, "MAX_UPLOAD_BYTES", 8)  # the episode's Workspace takes it at its seed
     server = make_server()
     with mcp_client(server) as client:
         _, call, _ = seed_mail(client, sandboxes)
@@ -1605,7 +1610,7 @@ def test_attachments_are_checked_in_the_sandbox_before_anything_is_copied(sandbo
     }
     # Gmail's attachments have no caps of their own, so these are this server's, which the episode's Workspace takes
     # at its seed and OfficeEnv's refusals name
-    monkeypatch.setattr(officeenv_app, "MAX_ATTACHMENT_BYTES", len(BOOK) + len(LONG) - 1)
+    monkeypatch.setattr(sandbox_app, "MAX_ATTACHMENT_BYTES", len(BOOK) + len(LONG) - 1)
     server = make_server()
     with mcp_client(server) as client:
         _, call, _ = seed_mail(client, sandboxes)
@@ -1616,7 +1621,7 @@ def test_attachments_are_checked_in_the_sandbox_before_anything_is_copied(sandbo
 
         assert "No file at /workspace/d/zero" in refusal({"path": "d/zero"})  # /dev/zero through a link
         assert "/workspace/huge.bin is over 20 MB" in refusal({"path": "huge.bin"})
-        many = [{"path": f"f{i}.csv"} for i in range(officeenv_app.MAX_ATTACHMENTS + 1)]
+        many = [{"path": f"f{i}.csv"} for i in range(sandbox_app.MAX_ATTACHMENTS + 1)]
         assert "one call sends at most 20 files from the workspace" in refusal(*many)
         both = refusal({"path": "out/totals.xlsx"}, {"path": "notes.csv"})
         assert f"together are over {len(BOOK) + len(LONG) - 1} bytes" in both, both
@@ -2259,7 +2264,8 @@ def test_sandbox_mode_signs_with_a_per_process_secret_and_names_its_cookie_neutr
     assert cookie.startswith("sid_") and cookie != make_server(name="oe2").get_session_cookie_name()
     with mcp_client(server) as client:
         assert list(client.post("/seed_session", json=seed_body()).cookies) == [cookie]
-    assert make_server(sandbox_provider=None).get_session_cookie_name() == named_key
+    base = make_base_server()  # Gym's own name for the cookie, on the server the sandboxed one subclasses
+    assert base.get_session_cookie_name() == base.get_session_middleware_key()
 
 
 def test_sandbox_mode_needs_one_worker() -> None:
@@ -2276,15 +2282,15 @@ def test_trusted_callers_are_this_node_and_the_trusted_networks() -> None:
         assert not is_trusted_caller(host, local=local, networks=networks), host
 
 
-# Without a sandbox provider.
+# The OfficeEnv server the sandboxed one subclasses.
 
 
-def test_without_a_sandbox_provider_nothing_changes_for_any_caller(monkeypatch) -> None:
+def test_the_officeenv_server_it_subclasses_changes_nothing_for_any_caller(monkeypatch) -> None:
     def no_lookup() -> frozenset[str]:
-        raise AssertionError("only sandbox mode looks up this node's addresses")
+        raise AssertionError("only the sandboxed server looks up this node's addresses")
 
-    monkeypatch.setattr(officeenv_app, "node_addresses", no_lookup)
-    server = make_server(sandbox_provider=None)
+    monkeypatch.setattr(sandbox_app, "node_addresses", no_lookup)
+    server = make_base_server()
     assert server.get_session_secret() == server.get_session_middleware_key()  # Gym's default signing
     with mcp_client(server, client=SANDBOX) as remote:
         seeded = remote.post("/seed_session", json=seed_body())
@@ -2512,7 +2518,7 @@ def load_prepare_rows():
     """sandbox/prepare_rows.py as a module."""
     import importlib.util
 
-    path = Path(officeenv_app.__file__).parent / "sandbox" / "prepare_rows.py"
+    path = Path(sandbox_app.__file__).parent / "sandbox" / "prepare_rows.py"
     spec = importlib.util.spec_from_file_location("prepare_rows", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -2614,7 +2620,7 @@ def test_each_harness_config_binds_its_harness_to_the_shared_episodes() -> None:
     ]:
         config = yaml.safe_load((configs / name).read_text())
         assert config["config_paths"] == [
-            "resources_servers/officeenv/configs/officeenv_sandbox_episodes.yaml",
+            "resources_servers/officeenv_sandbox/configs/officeenv_sandbox_episodes.yaml",
             f"responses_api_agents/{agent}/configs/{agent}.yaml",
             "environment_servers/single_agent_turn_legacy/configs/single_agent_turn_legacy.yaml",
         ], name
@@ -2689,7 +2695,7 @@ def test_the_sandbox_rows_seed_on_the_pinned_officeenv() -> None:
         "gmail_get_attachment",
     }
     assert {row["task_id"] for row in rows} >= {"sandbox_vendor_spend", "sandbox_vendor_spend_xlsx"}
-    with mcp_client(make_server(sandbox_provider=None)) as client:
+    with mcp_client(make_base_server()) as client:
         for index, row in enumerate(rows):
             assert row["officeenv_version"] == officeenv_version, "run sandbox/prepare_rows.py again"
             assert "tools" not in row["responses_create_params"]  # the harness takes its tools from the grant

@@ -5,7 +5,7 @@
 # a sandbox that lacks it (with apt-get, from the internet), or the `terminus-2` image of sandbox/Dockerfile.harness
 # has it.
 config_paths:
-  - resources_servers/officeenv/configs/officeenv_sandbox_episodes.yaml
+  - resources_servers/officeenv_sandbox/configs/officeenv_sandbox_episodes.yaml
   - responses_api_agents/terminus_2_sandboxed_agent/configs/terminus_2_sandboxed_agent.yaml
   - environment_servers/single_agent_turn_legacy/configs/single_agent_turn_legacy.yaml
 

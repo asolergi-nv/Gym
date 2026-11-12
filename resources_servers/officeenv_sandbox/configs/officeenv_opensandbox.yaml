@@ -3,7 +3,7 @@
 # the node for the model, OfficeEnv's MCP tools and the episode's file API. Compose with a model server:
 #
 #   gym env start \
-#     --config resources_servers/officeenv/configs/officeenv_opensandbox.yaml \
+#     --config resources_servers/officeenv_sandbox/configs/officeenv_opensandbox.yaml \
 #     --config responses_api_models/vllm_model/configs/vllm_model_for_training.yaml ...
 #
 # Credentials: `sandbox.opensandbox.connection` in env.yaml (domain, protocol, api_key, tls_verify), or
@@ -11,7 +11,7 @@
 # a scheme or `protocol` says otherwise, so a server that serves only https, as cell-3 does, needs one of them:
 # OPENSANDBOX_DOMAIN=https://<host>, or `protocol: https`.
 config_paths:
-  - resources_servers/officeenv/configs/officeenv_sandbox.yaml
+  - resources_servers/officeenv_sandbox/configs/officeenv_sandbox.yaml
   - nemo_gym/sandbox/providers/opensandbox/configs/opensandbox.yaml
 
 # A sandbox calls the model server and this resources server, so those two advertise the node's address. The head
@@ -21,7 +21,7 @@ absolute_ip_server_types: [responses_api_models, resources_servers]
 
 oe:
   resources_servers:
-    officeenv:
+    officeenv_sandbox:
       verified: false
       sandbox_config:
         # Stopgap until sandbox/Dockerfile's image is published to a registry the cell pulls from: a public image

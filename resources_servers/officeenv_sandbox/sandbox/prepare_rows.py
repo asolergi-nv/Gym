@@ -6,7 +6,7 @@ Each row carries the task's TaskSpec and a system and user message; it has no to
 sandboxed harness takes the episode's tools from its MCP grant and refuses request tools. The
 OfficeEnv that runs this script is the one the rows are stamped with.
 
-    python resources_servers/officeenv/sandbox/prepare_rows.py [output.jsonl] [--exposure tools|cli|api_search]
+    python resources_servers/officeenv_sandbox/sandbox/prepare_rows.py [output.jsonl] [--exposure tools|cli|api_search]
         [--tool-prefix <prefix>]
 
 ``--exposure`` sets how the harness reaches the apps (the server's SANDBOX_SURFACES): one MCP tool
