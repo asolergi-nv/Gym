@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import json
 import os
 import socket
 import threading
@@ -93,6 +94,16 @@ def instance():
         endpoint=f"http://127.0.0.1:{port}",
         metadata={"token": "secret", "request_timeout_seconds": 10},
     )
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            with browser_instance.DIRECT.open(f"{handle.endpoint}/healthz", timeout=0.2) as response:
+                assert json.load(response)["ok"] is True
+            break
+        except OSError:
+            if not thread.is_alive() or time.monotonic() >= deadline:
+                pytest.fail("browser instance fixture did not become ready")
+            time.sleep(0.01)
     yield handle, thread, result
 
 
