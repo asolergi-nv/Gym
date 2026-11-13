@@ -3,8 +3,6 @@
 # episode's required MCP tools there, so the episode grants none. Compose and run as configs/officeenv_sandbox.yaml
 # shows, with this config and `--agent opencode_agent`. OpenCode installs its release in each sandbox at session start
 # (from GitHub) and its plugin dependencies at every start (from the npm registry), so its sandboxes need the internet.
-# The `opencode` image of sandbox/Dockerfile.harness holds the release only: without the internet, the plugin
-# dependencies need the adapter's bundle too (README.md, "Images per harness").
 config_paths:
   - resources_servers/officeenv_sandbox/configs/officeenv_sandbox_episodes.yaml
   - responses_api_agents/opencode_agent/configs/opencode_agent.yaml

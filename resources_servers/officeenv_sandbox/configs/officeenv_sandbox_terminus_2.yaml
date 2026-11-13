@@ -2,8 +2,7 @@
 # commands (`cli`: sandbox/prepare_rows.py --exposure cli). Terminus 2 runs its agent on Gym's host and types into a
 # tmux session in each episode's sandbox, taking no MCP tools, so the episode grants none. Compose and run as
 # configs/officeenv_sandbox.yaml shows, with this config and `--agent terminus_2_sandboxed_agent`. It installs tmux in
-# a sandbox that lacks it (with apt-get, from the internet), or the `terminus-2` image of sandbox/Dockerfile.harness
-# has it.
+# a sandbox that lacks it (with apt-get, from the internet).
 config_paths:
   - resources_servers/officeenv_sandbox/configs/officeenv_sandbox_episodes.yaml
   - responses_api_agents/terminus_2_sandboxed_agent/configs/terminus_2_sandboxed_agent.yaml

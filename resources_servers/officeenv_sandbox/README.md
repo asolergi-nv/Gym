@@ -148,49 +148,9 @@ sandbox_config:
 
 A cell whose sandboxes have no internet pulls the image from a registry, pinned by digest: its
 tools cannot be installed at sandbox start, as the OpenSandbox config installs pandas and openpyxl.
-
-### Images per harness
-
-A harness that runs in the sandbox installs its runtime there at session start (Pi and Codex
-fetch Node and their package), which a sandbox without the internet cannot do.
-`sandbox/Dockerfile.harness` builds one image per harness on the documents image: each target
-runs the harness adapter's own installer as the adapter runs it (`sandbox/harness_runtime.sh`),
-so the runtime is where the adapter looks for it at session start and the adapter downloads
-nothing. OpenCode is the exception: at every start it also installs its plugin dependencies from
-the npm registry (about 63 MB), which its image does not hold. Without the internet, it needs the
-adapter's plugin-dependency bundle as well (`sandbox_plugin_dependencies_path` and
-`sandbox_plugin_dependencies_sha256`; the OpenCode adapter's README, "Pinned offline runtime
-bundle"). Build from the Gym checkout's root (`Dockerfile.harness.dockerignore` sends only the
-installers and that script):
-
-```bash
-docker build -f resources_servers/officeenv_sandbox/sandbox/Dockerfile.harness --target pi \
-  -t officeenv-sandbox:documents-pi .
-```
-
-The targets are `pi`, `codex`, `openclaw`, `opencode` and `terminus-2` (Terminus 2 runs its agent
-on Gym's host and needs only `tmux` in the sandbox). The versions are the adapters' configured
-ones (`PI_VERSION`, `CODEX_VERSION`, `OPENCLAW_VERSION` and `OPENCODE_VERSION` override them), and
-the runtime folders follow the adapters at this Gym revision: rebuild when an adapter changes.
-Check a built image without a network, where the adapter's installer must find the runtime and
-the harness must start:
-
-```bash
-docker run --rm --network none -v "$PWD:/gym:ro" officeenv-sandbox:documents-pi \
-  bash /gym/resources_servers/officeenv_sandbox/sandbox/harness_runtime.sh pi /gym/responses_api_agents
-```
-
-A run names its harness's image in `sandbox_config.image`, with `provides: [documents, office]`.
-An Environment Server binds one harness to one resources server, so in a mix of harnesses each
-harness gets its own OfficeEnv server with its own image. Hermes, Stirrup and Claude Code also
-reuse a runtime they find in the sandbox, but name its folder after their agent server's own
-install (the Hermes commit, Stirrup's version, Claude Code's binary digest), so they have no target
-yet; mini-SWE and Kilo Code install at every session start, whatever the image holds. Pi, Codex,
-OpenClaw and OpenCode keep their runtime under `/tmp`, which a provider that mounts a fresh `/tmp`
-would hide. An image keeps only the runtime: once the installer and the harness have run, the
-script removes what they leave behind, the archives the install unpacked, npm's cache and logs
-(in `~/.npm`, or in the runtime folder for an installer that moves `HOME`, as Codex's and
-OpenClaw's do), Node's compile cache in `/tmp` and the helper links Codex makes in `~/.codex`.
+The harnesses that run in the sandbox install their runtime there at session start too (Pi,
+Codex, OpenClaw and OpenCode from nodejs.org, npm or GitHub, mini-SWE from PyPI, and Terminus 2
+installs tmux where it is missing), so their sandboxes need the internet.
 
 ### Tools, commands or endpoints
 
@@ -339,8 +299,7 @@ mini-SWE its Python packages, in each sandbox at session start. What a sandbox s
 - Pi's own names: its session and runtime directories, the `NEMO_GYM_PI_*` variables its shell
   inherits, the model provider `nemo`, its supervisor's process names, and a system prompt that
   states the sandbox clock's date. Changing those is Pi agent work;
-- the other harnesses' own names, which their Gym adapters fix and the harness images keep where
-  the adapters look: the session and runtime folders of Codex (`/tmp/nemo-gym-codex-sessions/<id>`,
+- the other harnesses' own names, which their Gym adapters fix: the session and runtime folders of Codex (`/tmp/nemo-gym-codex-sessions/<id>`,
   `/tmp/nemo-gym-codex-node-22.19.0-<version>`), OpenClaw (`/tmp/nemo-gym-openclaw-sessions/<id>`,
   `/tmp/nemo-gym-openclaw-node-22.19.0-<version>`) and OpenCode
   (`/tmp/nemo-gym-opencode-sessions/<id>`, `/tmp/nemo-gym-opencode-runtime-<version>` and its

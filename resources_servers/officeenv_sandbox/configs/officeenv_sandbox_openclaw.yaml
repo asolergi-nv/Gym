@@ -2,7 +2,7 @@
 # commands (`cli`: sandbox/prepare_rows.py --exposure cli). OpenClaw borrows each episode's sandbox and takes no MCP
 # tools, so the episode grants none. Compose and run as configs/officeenv_sandbox.yaml shows, with this config and
 # `--agent openclaw_agent`. OpenClaw installs Node and its own package in each sandbox at session start (from
-# nodejs.org and npm), so its sandboxes need the internet, or the `openclaw` image of sandbox/Dockerfile.harness.
+# nodejs.org and npm), so its sandboxes need the internet.
 config_paths:
   - resources_servers/officeenv_sandbox/configs/officeenv_sandbox_episodes.yaml
   - responses_api_agents/openclaw_agent/configs/openclaw_agent.yaml
