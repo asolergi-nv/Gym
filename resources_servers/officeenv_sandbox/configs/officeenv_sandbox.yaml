@@ -34,6 +34,10 @@ pi_agent:
   responses_api_agents:
     pi_agent:
       finish_tool_names: [user_complete_task]
+      # the server whose rows these are, so they are checked against its task data schema
+      resources_server:
+        type: resources_servers
+        name: oe
       datasets:
       - name: example
         type: example
