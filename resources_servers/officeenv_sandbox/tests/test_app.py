@@ -10,6 +10,7 @@ routes, the reads and writes of the sandbox's files with their checks, the refus
 
 import asyncio
 import base64
+import hashlib
 import io
 import ipaddress
 import json
@@ -42,7 +43,7 @@ from fastapi.testclient import TestClient
 pytest.importorskip("officeenv", reason="OfficeEnv is not installed (README.md, 'The OfficeEnv version')")
 
 from officeenv import __version__ as officeenv_version
-from officeenv.files import FileApp, FileContent, ReadPlan
+from officeenv.files import FileApp, FileCallError, FileContent, ReadPlan
 from officeenv.service import Reply
 
 from nemo_gym.client import ServerClient
@@ -211,12 +212,14 @@ class FakeSandbox:
         self.files: dict[str, bytes] = {}  # what the server uploaded into it, by path
         self.modes: dict[str, int] = {}  # the mode of each upload's local file
         self.downloaded: list[str] = []  # the paths copied out of it, in order
+        self.sandbox_id: str | None = None  # the provider's id, once started
 
     async def start(self, spec) -> None:
         self.spec = spec
         if FakeSandbox.fail_on == "start":
             raise RuntimeError("the provider could not create the sandbox")
         FakeSandbox.started.append(self)
+        self.sandbox_id = f"sbx-{len(FakeSandbox.started)}"
 
     async def start_with_setup(self, spec, setup) -> None:
         await self.start(spec)
@@ -605,6 +608,47 @@ def test_with_tools_closed_at_task_end_the_file_api_closes_too(sandboxes, close_
         assert verified.json()["reward"] == 1.0, verified.text
 
 
+FILE_CALLS = {  # each file API call, as a sandbox makes it
+    "download": lambda client, auth: client.get("/v1/files/gdrive/F_LEDGER", headers=auth),
+    "create": lambda client, auth: client.post(
+        "/v1/files", params={"app": "gdrive", "name": "notes.csv"}, content=b"a,b\n", headers=auth
+    ),
+    "replace": lambda client, auth: client.put("/v1/files/gdrive/F_LEDGER", content=b"a,b\n", headers=auth),
+}
+
+
+@pytest.mark.parametrize("fails", [False, True], ids=["answered", "failed"])
+@pytest.mark.parametrize("verb", list(FILE_CALLS))
+def test_a_file_api_call_that_ends_the_task_publishes_it(sandboxes, monkeypatch, verb: str, fails: bool) -> None:
+    """A file API call runs the app's op through the same pipeline as a tool call (its injections among it), so it may
+    end the task too: the task state it leaves is published once it is over, whatever it answers, as a tool call's
+    is. /task_state reads the end, and with close_tools_on_task_end the next call is refused, so a file uploaded after
+    it cannot make the task pass."""
+    server = make_server(close_tools_on_task_end=True)
+    with mcp_client(server) as client:
+        seeded = client.post("/seed_session", json=seed_body())
+        auth = file_auth(server)
+        file_call = getattr(server.service, f"file_{verb}")
+
+        def ending_the_task(session_id: str, *args, **kwargs):
+            # as an op the call runs might: the user's task leaves pending
+            server.service.call(session_id, "user_complete_task", json.dumps({"answer": "done"}))
+            if fails:
+                raise FileCallError(503, {"error": {"code": 503, "message": "The service is unavailable"}})
+            return file_call(session_id, *args, **kwargs)
+
+        monkeypatch.setattr(server.service, f"file_{verb}", ending_the_task)
+        answered = FILE_CALLS[verb](client, auth)
+        assert answered.status_code == (503 if fails else 200), answered.text
+        assert client.get("/task_state", cookies=seeded.cookies).json() == {"task_ended": True}
+        late = client.post(
+            "/v1/files", params={"app": "gdrive", "name": "totals.csv"}, content=TOTALS.encode(), headers=auth
+        )
+        assert late.status_code == 409 and "its files are closed" in late.text, late.text
+        verified = client.post("/verify", json=VERIFY_BODY, cookies=seeded.cookies)
+        assert verified.json()["reward"] == 0.0, verified.text  # the late upload made nothing pass
+
+
 def test_a_failed_stop_before_grading_still_grades_and_close_stops_it(sandboxes) -> None:
     server = make_server()
     with mcp_client(server) as client:
@@ -920,9 +964,11 @@ def test_a_seed_is_admitted_again_in_its_turn(sandboxes, monkeypatch) -> None:
     assert built == ["rs-0"] and "rs-1" not in server._episodes and len(sandboxes.started) == 1
 
 
-def test_each_seed_logs_its_place_its_wait_and_its_build_time(sandboxes, monkeypatch, caplog) -> None:
+def test_each_seed_logs_its_place_its_wait_its_build_time_and_its_sandbox(sandboxes, monkeypatch, caplog) -> None:
     """One line per seed, for a CPU sample of the server to be read against: the seeds ahead of it, its wait for its
-    turn and its world's build. Gym's servers configure no logging, so the line has a handler of its own."""
+    turn and its world's build. A second names the sandbox lent to the session, and its start time: the harness's and
+    the provider's logs name the sandbox, this server's the session. Gym's servers configure no logging, so the lines
+    have a handler of their own."""
     server = make_server()
     slow_seeds(server, monkeypatch, [])
 
@@ -931,9 +977,15 @@ def test_each_seed_logs_its_place_its_wait_and_its_build_time(sandboxes, monkeyp
 
     with caplog.at_level(logging.INFO, logger=sandbox_app.SEED_LOGGER.name):
         asyncio.run(scenario())
-    pattern = re.compile(r"Seed of OfficeEnv session (rs-\d): (\d+) ahead, waited \d+\.\d\d s, built in \d+\.\d\d s")
+    seeds = re.compile(r"Seed of OfficeEnv session (rs-\d): (\d+) ahead, waited \d+\.\d\d s, built in \d+\.\d\d s")
+    lent = re.compile(r"Sandbox (sbx-\d) of OfficeEnv session (rs-\d) \(task sandbox-files\) started in \d+\.\d\d s")
     lines = [record.getMessage() for record in caplog.records if record.name == sandbox_app.SEED_LOGGER.name]
-    assert [pattern.fullmatch(line).groups() for line in lines] == [("rs-0", "0"), ("rs-1", "1"), ("rs-2", "2")]
+    seed_lines = [line for line in lines if line.startswith("Seed ")]
+    assert [seeds.fullmatch(line).groups() for line in seed_lines] == [("rs-0", "0"), ("rs-1", "1"), ("rs-2", "2")]
+    lent_lines = [lent.fullmatch(line) for line in lines if line not in seed_lines]
+    sandbox_ids = {match.group(2): match.group(1) for match in lent_lines}
+    assert sandbox_ids == {session: episode.sandbox.sandbox_id for session, episode in server._episodes.items()}
+    assert len(lines) == 6 and set(sandbox_ids.values()) == {"sbx-1", "sbx-2", "sbx-3"}
     assert sandbox_app.SEED_LOGGER.handlers and sandbox_app.SEED_LOGGER.level == logging.INFO
 
 
@@ -1341,6 +1393,45 @@ def test_an_upload_takes_a_workspace_file_by_its_path(sandboxes) -> None:
         assert sandbox.downloaded == ["/workspace/out/totals.xlsx"]  # the missing file was checked, never copied
         result = client.post("/verify", json=VERIFY_BODY, cookies=seeded.cookies).json()
         assert result["sandbox_files_uploaded"] == 1.0 and result["sandbox_bytes_uploaded"] == float(len(BOOK))
+        assert "sandbox_trace_failures" not in result  # no trace store, nothing to count
+
+
+@pytest.mark.parametrize("store_fails", [False, True], ids=["kept", "unwritable"])
+def test_the_trace_store_keeps_what_an_episode_is_handed_and_its_failures_fail_no_call(
+    sandboxes, tmp_path, caplog, store_fails: bool
+) -> None:
+    """With workspace_trace_store set, the files a call reads and the content a file API call sends are kept by
+    SHA-256, for the episode's trace to replay without a sandbox. The store is a record beside the episode: a write
+    it fails (here a store whose folder cannot be made; a full disk fails alike) is logged and counted in
+    sandbox_trace_failures, and the call goes on, so the episode is graded on what the policy did, unmasked. Before,
+    the upload failed (an internal_error tool output, a 500 from the file API) and the reward counted it."""
+    if store_fails:
+        (tmp_path / "blocked").write_text("a file where the store's parent folder goes")
+    store = tmp_path / ("blocked" if store_fails else "ok") / "trace"
+    server = make_server(workspace_trace_store=str(store))
+    with mcp_client(server) as client:
+        seeded, call, _ = seed_with_content(client)
+        (sandbox,) = sandboxes.started
+        sandbox.files["/workspace/out/totals.xlsx"] = BOOK  # as the model wrote it
+        with caplog.at_level(logging.ERROR):
+            created = call("gdrive_create_file", name="totals.xlsx", parents=["F_FIN"], content_path="out/totals.xlsx")
+            sent = client.post(
+                "/v1/files",
+                params={"app": "gdrive", "name": "totals.csv"},
+                content=TOTALS.encode(),
+                headers=file_auth(server),
+            )
+        assert created.get("name") == "totals.xlsx", created
+        assert sent.status_code == 200, sent.text
+        result = client.post("/verify", json=VERIFY_BODY, cookies=seeded.cookies).json()
+    assert result["reward"] == 1.0 and not result.get("mask_sample"), result
+    if store_fails:
+        assert result["sandbox_trace_failures"] == 2.0
+        assert caplog.text.count("Could not keep") == 2 and "NotADirectoryError" in caplog.text, caplog.text
+    else:
+        assert result["sandbox_trace_failures"] == 0.0
+        handed = (BOOK, TOTALS.encode())  # the file the upload read, and the file API's content
+        assert {path.name for path in store.iterdir()} == {hashlib.sha256(data).hexdigest() for data in handed}
 
 
 def test_without_an_inline_limit_text_comes_inline_and_other_files_through_the_workspace(sandboxes) -> None:

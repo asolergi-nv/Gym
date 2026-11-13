@@ -83,7 +83,8 @@ with no MCP tools. Each episode also:
      `sandbox_files_uploaded` and `sandbox_bytes_uploaded` (OfficeEnv's
      `EpisodeService.workspace_stats`), and passes on OfficeEnv's trace of the mode
      (`officeenv_workspace`); with `workspace_trace_store` set, the bytes the server hands an
-     episode are kept there, so the trace replays without a sandbox.
+     episode are kept there, so the trace replays without a sandbox. A write the store fails
+     (a full disk) is logged and counted in `sandbox_trace_failures`, and never fails the call.
 
    Episodes without a sandbox are unchanged. A model that pulls a workbook through the tool reads
    its bytes as base64 on every later request, and one that copies file content by hand gets it

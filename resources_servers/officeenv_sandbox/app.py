@@ -61,7 +61,7 @@ import sys
 import tempfile
 import time
 import weakref
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -105,10 +105,10 @@ if TYPE_CHECKING:
 
 # The OfficeEnv server's module, imported above, checks OfficeEnv's install first: without OfficeEnv, or with a release
 # older than its README names, the import stops there, naming the step that installs it.
-from officeenv.artifacts import ArtifactStore
+from officeenv.artifacts import write_artifact
 from officeenv.exposure import api_search as api_search_exposure
 from officeenv.files import FileApp, FileCallError, Unreadable, UploadHint, Workspace, WorkspaceWrite
-from officeenv.service import EpisodeService, Reply, parse_arguments
+from officeenv.service import Reply, parse_arguments
 
 
 LOGGER = logging.getLogger(__name__)
@@ -264,8 +264,8 @@ class OfficeEnvSandboxResourcesServerConfig(OfficeEnvResourcesServerConfig):
         description=(
             "Where the bytes the server hands a sandboxed episode are kept (the files its calls read, and the files "
             "its file API calls send), by SHA-256 in officeenv.artifacts' store format, so its trace "
-            "(officeenv_workspace) replays without a sandbox: an absolute path (EpisodeService's trace_store). None "
-            "keeps none."
+            "(officeenv_workspace) replays without a sandbox: an absolute path. A write that fails is logged and "
+            "counted (sandbox_trace_failures), and the call goes on. None keeps none."
         ),
     )
 
@@ -704,6 +704,7 @@ class _SandboxEpisode(_Episode):
     commands: int = 0
     commands_refused: int = 0  # calls to CLI_ROUTE made by hand rather than by an app's command
     endpoint_calls: int = 0
+    trace_failures: int = 0  # the files it was handed that the workspace trace store could not keep (_keep_in_trace)
 
     def usage(self) -> dict[str, float]:
         """What the episode sent beside MCP, through its surface's routes, and the files saved in its workspace, as
@@ -736,11 +737,6 @@ class OfficeEnvSandboxResourcesServer(OfficeEnvResourcesServer):
 
     def model_post_init(self, context: Any) -> None:
         super().model_post_init(context)
-        if self.config.workspace_trace_store:
-            # the service keeps the bytes this server hands an episode in the trace store, and reads a row's artifact
-            # references back from the artifact stores at seed
-            artifacts = ArtifactStore(self.config.artifacts_dirs) if self.config.artifacts_dirs else None
-            self.service = EpisodeService(artifacts=artifacts, trace_store=self.config.workspace_trace_store)
         if self.config.num_workers not in (None, 1):
             raise ValueError("OfficeEnv sandbox episodes are process-local and require num_workers=1")
         _show_seed_lines()
@@ -1012,6 +1008,7 @@ class OfficeEnvSandboxResourcesServer(OfficeEnvResourcesServer):
             spec = replace(spec, provider_options={**spec.provider_options, "network_policy": policy})
         sandbox = AsyncSandbox(provider_config)
         self._starting.add(session_id)
+        starting = time.monotonic()
         try:
             if episode.surface == "cli" or config.host_relay:
                 await sandbox.start_with_setup(spec, lambda box: self._prepare_sandbox(box, episode, named_configs))
@@ -1036,6 +1033,14 @@ class OfficeEnvSandboxResourcesServer(OfficeEnvResourcesServer):
             self._starting.discard(session_id)
         episode.token, episode.sandbox, episode.access = token, sandbox, access
         self._tokens[token] = session_id
+        # The harness's and the provider's logs name the sandbox, this server's the session: this line joins them.
+        SEED_LOGGER.info(
+            "Sandbox %s of OfficeEnv session %s (task %s) started in %.2f s",
+            sandbox.sandbox_id,
+            session_id,
+            task_id,
+            time.monotonic() - starting,
+        )
 
     async def _prepare_sandbox(self, sandbox: AsyncSandbox, episode: _SandboxEpisode, named_configs: Mapping) -> None:
         """Make a started sandbox ready to lend: a `cli` episode's apps become commands, then the host relay starts."""
@@ -1186,18 +1191,19 @@ class OfficeEnvSandboxResourcesServer(OfficeEnvResourcesServer):
         run: Callable[[Mapping[str, bytes | Unreadable]], Any] | None = None,
     ) -> Any:
         """Call ``tool_name`` with ``body`` (the service's call, or ``run`` given the files read for the call) under
-        the episode's lock, with the workspace files it names read from the sandbox before it (``_read_workspace``)
-        and the files it saved in the workspace (its reply's ``workspace_writes``) written there after it
-        (``_save_downloads``). Verification stops the sandbox under the same lock: a call under way when verification
-        begins finishes first, and one that comes later is refused. A call that raises writes nothing. The task state
-        the call leaves is published once the whole call is over, and with ``close_tools_on_task_end`` a call after a
-        published end is refused, as on the OfficeEnv server."""
+        the episode's lock, with the workspace files it names read from the sandbox before it (``_read_workspace``,
+        and kept in the trace store: ``_keep_in_trace``) and the files it saved in the workspace (its reply's
+        ``workspace_writes``) written there after it (``_save_downloads``). Verification stops the sandbox under the
+        same lock: a call under way when verification begins finishes first, and one that comes later is refused. A
+        call that raises writes nothing. The task state the call leaves is published once the whole call is over, and
+        with ``close_tools_on_task_end`` a call after a published end is refused, as on the OfficeEnv server."""
         async with self._locks.setdefault(session_id, asyncio.Lock()):
             try:
                 self._require_open(episode)
                 self._refuse_after_task_end(session_id)
                 reads = await self._read_workspace(session_id, episode, tool_name, body)
                 self._require_open(episode)  # verification may have begun while the call's files were read
+                self._keep_in_trace(session_id, episode, reads.values())
                 if run is not None:
                     reply = run(reads)
                 elif reads:
@@ -1291,6 +1297,8 @@ class OfficeEnvSandboxResourcesServer(OfficeEnvResourcesServer):
         if episode is not None:  # what it sent beside MCP, and moved through its workspace
             counted = {f"sandbox_{name}": float(moved.get(name, 0)) for name in WORKSPACE_STATS}
             result = result | episode.usage() | counted
+            if self.config.workspace_trace_store is not None:  # a trace that lacks these files does not replay
+                result = result | {"sandbox_trace_failures": float(episode.trace_failures)}
             if episode.provider_failure is not None:  # the reward would measure the sandbox, not the policy
                 result = result | {
                     "mask_sample": True,
@@ -1329,15 +1337,45 @@ class OfficeEnvSandboxResourcesServer(OfficeEnvResourcesServer):
         if grading or (self.config.close_tools_on_task_end and self._task_ends.get(session_id, False)):
             raise HTTPException(status_code=409, detail="The task has ended: its files are closed")
 
-    @staticmethod
-    def _file_answer(call: Callable[[], Any]) -> Any:
+    def _file_answer(self, session_id: str, call: Callable[[], Any]) -> Any:
         """What a file API call (OfficeEnv's file call, the agent's own action) answers, or the app's error with its
         HTTP status and body: a file it does not have, a name its folder holds, an app it has no file API for, a fault
-        the task injects."""
+        the task injects. A file call runs the app's op through the same pipeline as a tool call (its injections among
+        it), so it may end the task too: the task state it leaves is published once it is over, whatever it answers,
+        as a tool call's is (``/task_state``, and ``close_tools_on_task_end`` for the calls after it)."""
         try:
             return call()
         except FileCallError as exc:
             raise HTTPException(status_code=exc.status, detail=exc.body) from None
+        finally:
+            self._publish_task_state(session_id)
+
+    def _keep_in_trace(
+        self, session_id: str, episode: _SandboxEpisode | None, values: Iterable[bytes | Unreadable]
+    ) -> None:
+        """Keep the bytes this server hands an episode (the files a call read, the content a file API call sends) in
+        the workspace trace store, by SHA-256, so the episode's trace (officeenv_workspace) replays without a sandbox.
+        The store is a record kept beside the episode: a write that fails (a full disk, a store gone) is logged and
+        counted (``sandbox_trace_failures``), and the call goes on as it would without a store, so the reward still
+        measures the policy."""
+        store = self.config.workspace_trace_store
+        if store is None:
+            return
+        for value in values:
+            if not isinstance(value, bytes):  # a file that could not be read hands nothing
+                continue
+            try:
+                write_artifact(store, value)
+            except Exception as exc:
+                LOGGER.error(
+                    "Could not keep %d bytes of OfficeEnv session %s in the workspace trace store: %s: %s",
+                    len(value),
+                    session_id,
+                    type(exc).__name__,
+                    exc,
+                )
+                if episode is not None:
+                    episode.trace_failures += 1
 
     @staticmethod
     def _provider_failed(session_id: str, episode: _SandboxEpisode, doing: str, exc: BaseException) -> HTTPException:
@@ -1424,7 +1462,7 @@ class OfficeEnvSandboxResourcesServer(OfficeEnvResourcesServer):
         UTF-8 text and application/octet-stream for any other bytes."""
         session_id = self._file_session(request)
         self._refuse_once_closed(session_id)
-        downloaded = self._file_answer(lambda: self.service.file_download(session_id, app_name, file_id))
+        downloaded = self._file_answer(session_id, lambda: self.service.file_download(session_id, app_name, file_id))
         return Response(content=downloaded.data, media_type=downloaded.mime_type or media_type_of(downloaded.data))
 
     async def upload_file(
@@ -1434,8 +1472,10 @@ class OfficeEnvSandboxResourcesServer(OfficeEnvResourcesServer):
         self._refuse_once_closed(session_id)
         data = await self._content_args(request)
         self._refuse_once_closed(session_id)  # verification may have begun while the body streamed in
+        self._keep_in_trace(session_id, self._episodes.get(session_id), [data])
         created = self._file_answer(
-            lambda: self.service.file_create(session_id, app, name, data, parent=parent, mime_type=mime_type)
+            session_id,
+            lambda: self.service.file_create(session_id, app, name, data, parent=parent, mime_type=mime_type),
         )
         return JSONResponse(created)
 
@@ -1446,8 +1486,9 @@ class OfficeEnvSandboxResourcesServer(OfficeEnvResourcesServer):
         self._refuse_once_closed(session_id)
         data = await self._content_args(request)
         self._refuse_once_closed(session_id)  # verification may have begun while the body streamed in
+        self._keep_in_trace(session_id, self._episodes.get(session_id), [data])
         replaced = self._file_answer(
-            lambda: self.service.file_replace(session_id, app_name, file_id, data, mime_type=mime_type)
+            session_id, lambda: self.service.file_replace(session_id, app_name, file_id, data, mime_type=mime_type)
         )
         return JSONResponse(replaced)
 
