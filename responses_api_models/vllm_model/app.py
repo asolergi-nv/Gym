@@ -1,5 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# Dynamo backport: https://github.com/NVIDIA-NeMo/Gym/pull/4817
+# Source: 234bb55da38f7069e3d1eefa6cf9b95401008573 (Apache-2.0).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,7 +23,7 @@ import os
 from copy import deepcopy
 from threading import Lock
 from time import monotonic, time, time_ns
-from typing import Any, ClassVar, Dict, List, Optional, Union
+from typing import Any, ClassVar, Dict, List, Literal, Optional, Union
 
 from aiohttp.client_exceptions import ClientResponseError
 from fastapi import Request, Response
@@ -56,8 +58,11 @@ from nemo_gym.token_id_capture import (
 from nemo_gym.token_id_capture.config import token_id_capture_config
 from nemo_gym.token_id_capture.external_capture import (
     ExternalCaptureHandler,
+    add_dynamo_gym_extras,
     make_external_capture_handler,
+    pop_dynamo_call_result,
 )
+from nemo_gym.token_id_capture.records import TOKEN_FIELDS
 
 
 LOG = logging.getLogger("nemo_gym.vllm_model")
@@ -164,6 +169,10 @@ class VLLMModelConfig(BaseResponsesAPIModelConfig):
     return_token_id_information: bool
     # Request inline prompt and generation token IDs from compatible vLLM endpoints.
     request_prompt_and_generation_token_ids: bool = False
+    # Policy traffic goes to a core-owned Dynamo frontend; vLLM still owns generation.
+    dynamo_frontend: bool = False
+    reasoning_field: Literal["reasoning_content", "both"] = "both"
+    session_key_headers: List[str] = Field(default_factory=list)
     propagate_context_overflow_errors: bool = False
 
     uses_reasoning_parser: bool
@@ -235,6 +244,17 @@ class VLLMModelConfig(BaseResponsesAPIModelConfig):
     # ``data:audio/<fmt>;base64,...`` URI at request time — keeps the JSONL
     # small without depending on vLLM's ``--allowed-local-media-path``.
     audio_root: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _validate_dynamo_frontend(self) -> "VLLMModelConfig":
+        if self.dynamo_frontend and (
+            self.use_completions_api
+            or self.is_responses_native
+            or self.supply_prefix_token_ids
+            or self.request_prompt_and_generation_token_ids
+        ):
+            raise ValueError("Dynamo supports chat requests without direct prefix supply or return_token_ids")
+        return self
 
     @model_validator(mode="after")
     def _validate_prefix_supply(self) -> "VLLMModelConfig":
@@ -332,6 +352,7 @@ class VLLMModel(SimpleResponsesAPIModel):
                 base_url=base_url,
                 api_key=self.config.api_key,
                 default_headers=self.config.default_headers,
+                session_key_headers=self.config.session_key_headers,
                 max_connection_retries=(
                     self.config.endpoint_connection_retries if self.config.endpoint_file else None
                 ),
@@ -363,9 +384,10 @@ class VLLMModel(SimpleResponsesAPIModel):
                     "token_id_capture.external_staging requires return_token_id_information=false; "
                     "worker custody replaces the token echo"
                 )
-            self._external_capture_handler = make_external_capture_handler(
-                capture_config.token_id_capture.external_staging_backend
-            )
+            backend = capture_config.token_id_capture.external_staging_backend
+            if self.config.dynamo_frontend and backend != "dynamo_worker":
+                raise ValueError("dynamo_frontend requires external_staging_backend=dynamo_worker")
+            self._external_capture_handler = make_external_capture_handler(backend)
 
         self._chat_template_tokenizer = None
         if self.config.use_completions_api and self.config.render_chat_template:
@@ -725,8 +747,65 @@ class VLLMModel(SimpleResponsesAPIModel):
             body_dict = self._external_capture_handler.prepare_request(body_dict)
         else:
             body_dict = self._apply_prefix_supply(body_dict)
+        if self.config.dynamo_frontend:
+            self._prepare_dynamo_request(body_dict)
 
         return body_dict
+
+    def _prepare_dynamo_request(self, body_dict: Dict[str, Any]) -> None:
+        """Fit a chat request to the Dynamo frontend, which rejects unknown top-level fields.
+
+        Every request carries the ``nemo_rl:gym:`` annotation. Without capture, it holds the last echoed
+        turn's tokens as ``required_prefix_token_ids``, which NeMo RL's native server derives from the
+        messages itself. A capture call resolves its prefix from staging, and the capture handler has
+        already added its ``ng_capture``. The echoed token fields, which the frontend also rejects, are
+        then stripped from the messages.
+        """
+        # The owned engine returns token metadata in nvext independently of the
+        # direct-vLLM flag, which Dynamo's OpenAI request schema does not accept.
+        body_dict.pop("return_tokens_as_token_ids", None)
+        extras = {
+            name: body_dict.pop(name)
+            for name in ("stop_token_ids", "skip_special_tokens", "include_stop_str_in_output")
+            if name in body_dict
+        }
+        if self._external_capture_handler is None:
+            for message_dict in reversed(body_dict.get("messages") or []):
+                if "prompt_token_ids" in message_dict:
+                    extras["required_prefix_token_ids"] = (
+                        message_dict["prompt_token_ids"] + message_dict["generation_token_ids"]
+                    )
+                    break
+        add_dynamo_gym_extras(body_dict, extras)
+        for message_dict in body_dict.get("messages") or []:
+            # The baseline mirrors reasoning under both names; Dynamo accepts
+            # only one. Reject disagreement rather than silently choosing.
+            reasoning = message_dict.pop("reasoning", None)
+            if reasoning is not None:
+                existing = message_dict.get("reasoning_content")
+                if existing is not None and existing != reasoning:
+                    raise ValueError("Dynamo received conflicting reasoning aliases")
+                message_dict["reasoning_content"] = reasoning
+            for field_name in TOKEN_FIELDS:
+                message_dict.pop(field_name, None)
+
+    def _lift_dynamo_call_result(self, chat_completion_dict: Dict[str, Any]) -> None:
+        """Move the engine's ``nvext.nemo_rl`` token fields onto the message, where the native server puts them.
+
+        ``routed_experts`` comes along when router replay is on. The token-information path below then
+        validates the fields as it does the native server's, including the log probability count.
+        """
+        result = pop_dynamo_call_result(chat_completion_dict)
+        if not self.config.return_token_id_information:
+            return
+        if result is None:
+            raise RuntimeError(f"`{self.config.name}` got a Dynamo response without nvext.nemo_rl.")
+        missing = REQUIRED_TOKEN_METADATA_FIELDS.difference(result)
+        if missing:
+            raise RuntimeError(f"`{self.config.name}` got Dynamo nvext.nemo_rl without: {', '.join(sorted(missing))}.")
+        chat_completion_dict["choices"][0]["message"].update(
+            {field: result[field] for field in TOKEN_METADATA_FIELDS.intersection(result)}
+        )
 
     def _preserve_envelope_id(self) -> bool:
         """Keep the backend envelope id only for requests with an active external-capture context."""
@@ -874,7 +953,12 @@ class VLLMModel(SimpleResponsesAPIModel):
             )
 
         try:
-            chat_completion_dict = await client.create_chat_completion(**body_dict)
+            extra_headers = (
+                self._external_capture_handler.request_headers() if self._external_capture_handler is not None else {}
+            )
+            chat_completion_dict = await client.create_chat_completion(
+                **({"_headers": extra_headers} if extra_headers else {}), **body_dict
+            )
         except ClientResponseError as e:
             if transport_io_enabled:
                 finished_ns = time_ns()
@@ -979,6 +1063,8 @@ class VLLMModel(SimpleResponsesAPIModel):
 
         if self._external_capture_handler is not None:
             self._external_capture_handler.prepare_response(chat_completion_dict)
+        elif self.config.dynamo_frontend:
+            self._lift_dynamo_call_result(chat_completion_dict)
 
         if self.config.return_token_id_information:
             message_dict = choice_dict["message"]
@@ -1574,6 +1660,7 @@ class VLLMModel(SimpleResponsesAPIModel):
                 base_url=url,
                 api_key=self.config.api_key,
                 default_headers=self.config.default_headers,
+                session_key_headers=self.config.session_key_headers,
                 max_connection_retries=self.config.endpoint_connection_retries,
             )
         ]

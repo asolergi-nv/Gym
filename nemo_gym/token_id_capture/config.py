@@ -1,5 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# Dynamo backport: https://github.com/NVIDIA-NeMo/Gym/pull/4817
+# Source: 234bb55da38f7069e3d1eefa6cf9b95401008573 (Apache-2.0).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -93,7 +95,7 @@ from nemo_gym.token_id_capture.protocols import (
 logger = logging.getLogger(__name__)
 
 TOKEN_ID_CAPTURE_BLOCK = "token_id_capture"
-ExternalStagingBackend = Literal["vllm_worker", "megatron_worker"]
+ExternalStagingBackend = Literal["vllm_worker", "megatron_worker", "dynamo_worker"]
 
 
 class NonGeneratingRequest(BaseModel):
@@ -208,7 +210,7 @@ class TokenIdCaptureConfig(BaseModel):
                 "token_id_capture.external_staging requires rebuild_response=false because the "
                 "framework owns staged-record finalization"
             )
-        if block.external_staging_backend == "megatron_worker" and not block.external_staging:
+        if block.external_staging_backend != "vllm_worker" and not block.external_staging:
             raise ValueError("token_id_capture.external_staging_backend requires external_staging=true")
         if not block.enabled:
             # Keep inactive settings for templated configurations.

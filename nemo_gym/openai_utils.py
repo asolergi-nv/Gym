@@ -1,5 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# Dynamo backport: https://github.com/NVIDIA-NeMo/Gym/pull/4817
+# Source: 234bb55da38f7069e3d1eefa6cf9b95401008573 (Apache-2.0).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -1301,6 +1303,10 @@ class NeMoGymAsyncOpenAI(BaseModel):  # pragma: no cover
         description="Extra headers to include in every request.",
     )
 
+    session_key_headers: List[str] = Field(
+        default_factory=list, description="Headers carrying the current rollout attempt identity."
+    )
+
     # Spent-key/auth trip: (status, body, url). Later calls raise a fresh exception.
     _permanent_trip: Optional[tuple[int, bytes, str]] = PrivateAttr(default=None)
 
@@ -1334,12 +1340,27 @@ class NeMoGymAsyncOpenAI(BaseModel):  # pragma: no cover
         if self._permanent_trip is not None:
             self._raise_permanent_error()
         request_headers = request_kwargs.pop("headers", {})
+        session_headers = {}
+        if self.session_key_headers:
+            # Break openai_utils -> rollout_correlation -> config_types -> openai_utils.
+            from nemo_gym.rollout_correlation import current_rollout_id
+
+            session_key = current_rollout_id()
+            if session_key is not None:
+                session_headers = {name: session_key for name in self.session_key_headers}
+        # HTTP field names are case-insensitive. A capture-key override must
+        # replace a differently-cased default rather than send two identities.
+        headers = {}
+        for layer in (
+            self.default_headers,
+            session_headers,
+            request_headers,
+            {"Authorization": f"Bearer {self.api_key}"},
+        ):
+            for name, value in layer.items():
+                headers[name.lower()] = (name, value)
         request_kwargs = request_kwargs | {
-            "headers": self.default_headers
-            | request_headers
-            | {
-                "Authorization": f"Bearer {self.api_key}",
-            },
+            "headers": dict(headers.values()),
             "_internal": self.internal,
             "_max_connection_retries": self.max_connection_retries,
         }
@@ -1400,11 +1421,13 @@ class NeMoGymAsyncOpenAI(BaseModel):  # pragma: no cover
         await self._raise_for_status(response, request_kwargs)
         return await get_response_json(response)
 
-    async def create_chat_completion(self, **kwargs):
+    async def create_chat_completion(self, *, _headers: Optional[Dict[str, str]] = None, **kwargs):
         request_kwargs = dict(
             url=f"{self.base_url}/chat/completions",
             json=kwargs,
         )
+        if _headers:
+            request_kwargs["headers"] = _headers
         response = await self._request(method="POST", **request_kwargs)
 
         await self._raise_for_status(response, request_kwargs)
