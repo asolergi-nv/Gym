@@ -1,11 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# Dynamo backport: https://github.com/NVIDIA-NeMo/Gym/pull/4817
+# Source: 234bb55da38f7069e3d1eefa6cf9b95401008573 (Apache-2.0).
 
 """Backend strategies for framework-owned token capture."""
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 from abc import ABC, abstractmethod
 from typing import Any, Protocol
 
@@ -43,11 +47,71 @@ LOGGER = logging.getLogger(__name__)
 _MEGATRON_TRANSPORT_FIELDS = ("compact_prompt_token_ids",)
 
 
+# The baseline has no durable refusal-settlement API: this marker carries only
+# the engine error identity; the capture call remains failed/incomplete.
+CAPTURE_REFUSAL_HEADER = "x-ng-capture-refused"
+DYNAMO_GYM_EXTRAS_ANNOTATION_PREFIX = "nemo_rl:gym:"
+_DYNAMO_CALL_RESULT_FIELD = "nemo_rl"
+DYNAMO_SESSION_ID_HEADER = "x-dynamo-session-id"
+_DYNAMO_CAPTURE_REFUSAL = re.compile(rf" \[{re.escape(CAPTURE_REFUSAL_HEADER)}: ([^\]]+)\]\Z")
+
+
+def add_dynamo_gym_extras(request_payload: dict[str, Any], extras: dict[str, Any]) -> None:
+    """Merge ``extras`` into the request's ``nemo_rl:gym:`` annotation, adding the annotation if absent.
+
+    ``nvext`` and its list are copied so a shared config dict is never mutated.
+    """
+    nvext = request_payload.get("nvext")
+    if nvext is None:
+        nvext = {}
+    if not isinstance(nvext, dict):
+        raise ValueError("nvext must be a JSON object")
+    annotations = nvext.get("annotations") or []
+    if not isinstance(annotations, list):
+        raise ValueError("nvext.annotations must be a JSON list")
+    merged: dict[str, Any] = {}
+    others = []
+    for annotation in annotations:
+        if isinstance(annotation, str) and annotation.startswith(DYNAMO_GYM_EXTRAS_ANNOTATION_PREFIX):
+            merged = json.loads(annotation.removeprefix(DYNAMO_GYM_EXTRAS_ANNOTATION_PREFIX))
+            if not isinstance(merged, dict):
+                raise ValueError("Dynamo Gym extras annotation must contain a JSON object")
+        else:
+            others.append(annotation)
+    merged.update(extras)
+    extras_annotation = DYNAMO_GYM_EXTRAS_ANNOTATION_PREFIX + json.dumps(merged, separators=(",", ":"))
+    request_payload["nvext"] = {**nvext, "annotations": [*others, extras_annotation]}
+
+
+def pop_dynamo_call_result(response_payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Remove ``nvext`` from a Dynamo response and return the engine's ``nvext.nemo_rl`` call result, if any."""
+    nvext = response_payload.pop("nvext", None)
+    result = nvext.get(_DYNAMO_CALL_RESULT_FIELD) if isinstance(nvext, dict) else None
+    return result if isinstance(result, dict) else None
+
+
+def dynamo_capture_refusal_suffix(model_call_id: str) -> str:
+    """What the engine behind Dynamo's frontend appends to the error message of a capture call it refused."""
+    return f" [{CAPTURE_REFUSAL_HEADER}: {model_call_id}]"
+
+
+def split_dynamo_capture_refusal(message: str) -> tuple[str, str | None]:
+    """Split ``dynamo_capture_refusal_suffix`` off an error message: the engine's message, and the refused call."""
+    match = _DYNAMO_CAPTURE_REFUSAL.search(message)
+    if match is None:
+        return message, None
+    return message[: match.start()], match.group(1)
+
+
 class ExternalCaptureHandler(Protocol):
     """Prepare and finalize one backend-specific external capture call."""
 
     def prepare_request(self, request_payload: dict[str, Any]) -> dict[str, Any]:
         """Attach capture instructions to an admitted engine request."""
+        ...
+
+    def request_headers(self) -> dict[str, str]:
+        """Extra headers for the current admitted request."""
         ...
 
     def prepare_response(self, response_payload: dict[str, Any]) -> None:
@@ -106,6 +170,10 @@ class _BaseExternalCaptureHandler(ABC):
         admission: CaptureAdmission,
     ) -> dict[str, Any]:
         """Attach backend-specific fields after shared admission checks."""
+
+    def request_headers(self) -> dict[str, str]:
+        """No extra headers for directly addressed backends."""
+        return {}
 
     def prepare_response(self, response_payload: dict[str, Any]) -> None:
         """Strip transport fields and retain the acknowledgement until API conversion finishes.
@@ -341,10 +409,55 @@ def _reject_multimodal_content(request_payload: dict[str, Any]) -> None:
                 )
 
 
+class DynamoWorkerCaptureHandler(_BaseExternalCaptureHandler):
+    """Commit lineage after a Dynamo engine worker durably stages the token delta.
+
+    The Dynamo frontend accepts only OpenAI fields plus ``nvext``, so the admission travels as
+    ``ng_capture`` in the request's ``nemo_rl:gym:`` annotation, and the acknowledgement comes back
+    as ``nvext.nemo_rl.ng_commit_coords``.
+    """
+
+    _BACKEND_LABEL = "Dynamo"
+
+    def _prepare_admitted_request(
+        self,
+        request_payload: dict[str, Any],
+        admission: CaptureAdmission,
+    ) -> dict[str, Any]:
+        choice_count = request_payload.get("n")
+        if choice_count is not None and choice_count != 1:
+            raise ValueError("Dynamo token capture requires n=1")
+        # The prefix is resolved on the worker from ``staging_chain``, so no prefix ids travel. The
+        # engine generates what the request asks for, as the vLLM worker does, so the call asks for
+        # the sampled tokens' log probabilities, which the worker stages; score centering's
+        # ``top_logprobs`` is kept.
+        add_dynamo_gym_extras(request_payload, {NG_CAPTURE_FIELD: admission.model_dump(mode="json")})
+        request_payload["logprobs"] = True
+        if request_payload.get("top_logprobs") is None:
+            request_payload["top_logprobs"] = 0
+        return request_payload
+
+    def request_headers(self) -> dict[str, str]:
+        """Use the rollout attempt as affinity key; captured prefixes remain in shared staging."""
+        context = current_capture_context()
+        if context is None or not context.external_staging or context.capture_admission is None:
+            return {}
+        return {DYNAMO_SESSION_ID_HEADER: context.capture_admission.rollout_id}
+
+    def prepare_response(self, response_payload: dict[str, Any]) -> None:
+        """Lift the acknowledgement out of ``nvext.nemo_rl`` to where the native response carries it."""
+        result = pop_dynamo_call_result(response_payload)
+        if result is not None and NG_COMMIT_COORDS_FIELD in result:
+            response_payload[NG_COMMIT_COORDS_FIELD] = result[NG_COMMIT_COORDS_FIELD]
+        super().prepare_response(response_payload)
+
+
 def make_external_capture_handler(backend: ExternalStagingBackend) -> ExternalCaptureHandler:
     """Create the external capture strategy selected by typed configuration."""
     if backend == "vllm_worker":
         return VLLMWorkerCaptureHandler()
     if backend == "megatron_worker":
         return MegatronWorkerCaptureHandler()
+    if backend == "dynamo_worker":
+        return DynamoWorkerCaptureHandler()
     raise ValueError(f"Unsupported external staging backend: {backend}")
