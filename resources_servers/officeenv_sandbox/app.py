@@ -68,6 +68,7 @@ from pathlib import Path
 from secrets import token_urlsafe
 from typing import TYPE_CHECKING, Any, Literal
 
+import anyio
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
@@ -156,6 +157,7 @@ UNLIMITED_INLINE_FILE_BYTES = 20_000_000
 SERVER_SHUTDOWN_TIMEOUT_KEY = "server_shutdown_timeout_seconds"
 SHUTDOWN_MARGIN_S = 2.0
 SHUTDOWN_STOPS_AT_ONCE = 64
+SANDBOX_STOP_TIMEOUT_S = 120.0  # how long one sandbox's stop may take (stop_sandbox), as Gym core's lent sandboxes
 # In sandbox mode, before each world build the event loop runs what is ready for this long, so the requests in flight
 # finish before the build holds the loop: a harness's MCP setup is a few requests of a few dozen steps of the loop each,
 # and a training cap's burst of setups and tool calls needs many of them. A fixed gap: under uvloop nothing tells when
@@ -532,6 +534,16 @@ def copied_file(local: Path, limit: int) -> bytes | Unreadable:
     if not stat.S_ISREG(info.st_mode):
         return Unreadable("missing")
     return Unreadable("too_large") if info.st_size > limit else local.read_bytes()
+
+
+async def stop_sandbox(sandbox: AsyncSandbox) -> None:
+    """Stop ``sandbox`` within SANDBOX_STOP_TIMEOUT_S, even while the request that holds it is being cancelled. Gym
+    runs each route in an anyio task group (ClientDisconnectCancellationMiddleware) and cancels it, with every later
+    await in it, when its client disconnects or the server shuts down: an unshielded stop would never run, and the
+    sandbox would outlive every reference to it (Gym core's lent sandboxes stop theirs so). A native
+    ``task.cancel()``, as shutdown's deadline cancels the stops it waits for, still cuts it."""
+    with anyio.CancelScope(shield=True), anyio.fail_after(SANDBOX_STOP_TIMEOUT_S):
+        await sandbox.stop()
 
 
 async def sandbox_file_sizes(sandbox: Any, paths: list[str]) -> dict[str, int | None]:
@@ -970,7 +982,12 @@ class OfficeEnvSandboxResourcesServer(OfficeEnvResourcesServer):
         self, session_id: str, episode: _SandboxEpisode, image: SandboxImage, *, task_id: str
     ) -> None:
         """Start the episode's sandbox from ``image`` with the workspace guide, for a `cli` episode its apps'
-        commands, and the episode's API (its URL and token) in its environment and at CREDENTIALS_PATH."""
+        commands, and the episode's API (its URL and token) in its environment and at CREDENTIALS_PATH.
+
+        The start runs to its end once begun, even when the seed's request is cancelled meanwhile (its client gave up,
+        or the server is shutting down: ``stop_sandbox``): a create cut in flight leaves a sandbox whose id the
+        provider never returned, which only its own reap, in the background, could find. A seed cancelled while its
+        sandbox started lends nothing: it stops the sandbox by its id and logs it."""
         config = self.config.sandbox_config
         named_configs = get_global_config_dict()
         token = token_urlsafe(32)
@@ -1010,24 +1027,38 @@ class OfficeEnvSandboxResourcesServer(OfficeEnvResourcesServer):
         self._starting.add(session_id)
         starting = time.monotonic()
         try:
-            if episode.surface == "cli" or config.host_relay:
-                await sandbox.start_with_setup(spec, lambda box: self._prepare_sandbox(box, episode, named_configs))
-            else:
-                await sandbox.start(spec)
+            with anyio.CancelScope(shield=True):  # the start runs to its end (the docstring)
+                if episode.surface == "cli" or config.host_relay:
+                    await sandbox.start_with_setup(
+                        spec, lambda box: self._prepare_sandbox(box, episode, named_configs)
+                    )
+                else:
+                    await sandbox.start(spec)
+                descriptor = await sandbox.serialize()
+            await anyio.lowlevel.checkpoint()  # a seed cancelled meanwhile lends nothing
             access = SandboxAccess(
                 connection=DirectSandboxConnection(
-                    provider_config_ref=self.config.sandbox_provider, descriptor=await sandbox.serialize()
+                    provider_config_ref=self.config.sandbox_provider, descriptor=descriptor
                 ),
                 workdir=config.workdir,
             )
-        except BaseException:
+        except BaseException as exc:
+            sandbox_id = sandbox.sandbox_id
             try:
-                await sandbox.stop()  # also closes the provider of a sandbox that never started
+                await stop_sandbox(sandbox)  # also closes the provider of a sandbox that never started
             except Exception:  # the seed's own error answers; the sandbox is kept for shutdown to stop
                 LOGGER.exception(
                     "Failed to stop the sandbox of OfficeEnv session %s after its seed failed", session_id
                 )
                 self._unstopped.append((session_id, sandbox))
+            else:
+                if isinstance(exc, asyncio.CancelledError) and sandbox_id is not None:
+                    SEED_LOGGER.info(
+                        "Sandbox %s of OfficeEnv session %s (task %s) stopped: its seed was cancelled as it started",
+                        sandbox_id,
+                        session_id,
+                        task_id,
+                    )
             raise
         finally:
             self._starting.discard(session_id)
@@ -1051,18 +1082,21 @@ class OfficeEnvSandboxResourcesServer(OfficeEnvResourcesServer):
             await start_relay(sandbox, config.host_relay, relay_ports(named_configs, own_port=self.config.port))
 
     async def _release(self, episode: _SandboxEpisode) -> None:
-        """Stop the episode's sandbox and revoke its file API token; a failed stop can be retried."""
+        """Stop the episode's sandbox and revoke its file API token; a failed stop can be retried. The stop finishes
+        even when the request that asked for it is cancelled meanwhile (``stop_sandbox``)."""
         self._tokens.pop(episode.token, None)
         if episode.sandbox is not None:
-            await episode.sandbox.stop()
+            await stop_sandbox(episode.sandbox)
             episode.sandbox = None
 
     async def shutdown(self) -> None:
         """Stop the sandboxes of open episodes, all at once and within the time Gym's run command leaves its servers
         once it signals them to stop (``server_shutdown_timeout_seconds``, then it kills them): a sandbox left running
         stays on the cell until its TTL. A seed still starting one holds its episode's lock, so its stop waits for the
-        seed, and a seed that comes later starts none. The sandboxes of failed seeds whose stop failed too are stopped
-        alike, the one a seed still starting leaves as it fails among them. The sandboxes not stopped by the
+        seed, and a seed that comes later starts none. A seed whose request Gym cancelled as the server began to shut
+        down (uvicorn cancels the requests in flight first) still finishes its start and stops what it started
+        (``_lend_sandbox``), and this stop waits for that too. The sandboxes of failed seeds whose stop failed too are
+        stopped alike, the one a seed still starting leaves as it fails among them. The sandboxes not stopped by the
         deadline are logged for a reaper: the lent ones, those of failed seeds, and those whose create is still in
         flight, apart."""
         self._shutting_down = True
@@ -1088,7 +1122,7 @@ class OfficeEnvSandboxResourcesServer(OfficeEnvResourcesServer):
         async def stop_unstopped(left: tuple[str, AsyncSandbox]) -> None:
             async with at_once:
                 try:
-                    await left[1].stop()
+                    await stop_sandbox(left[1])
                 except Exception:
                     LOGGER.exception("Failed to stop the sandbox of OfficeEnv session %s's failed seed", left[0])
                 else:
@@ -1107,7 +1141,7 @@ class OfficeEnvSandboxResourcesServer(OfficeEnvResourcesServer):
         # still in flight (its seed holds the episode's lock, so the stop was cut waiting for it)
         lent = sorted(session_id for session_id, episode in self._episodes.items() if episode.sandbox is not None)
         failed = sorted(session_id for session_id, _ in self._unstopped)
-        starting = sorted(self._starting)  # the provider deletes a cancelled create while this process lives
+        starting = sorted(self._starting)  # their seeds stop them once their creates return, if the process lives
         if lent or failed or starting:
             LOGGER.error(
                 "Shutdown left %d OfficeEnv sandboxes running after %.1f s; a reaper must stop them. %d lent, "

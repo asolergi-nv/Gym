@@ -98,7 +98,10 @@ with no MCP tools. Each episode also:
 When the server shuts down (a job's end, Ctrl-C), it stops the sandboxes of open episodes all at
 once, within Gym's `server_shutdown_timeout_seconds` less 2 s for the exit. The sandboxed configs
 set it to 30 s, since Gym's default of 1 s cannot stop a collection's sandboxes. Any sandbox left
-running is logged at ERROR with its session, for a reaper.
+running is logged at ERROR with its session, for a reaper. Gym cancels the requests in flight
+first, and a request whose client gives up: a seed cancelled so still finishes starting its
+sandbox, then stops it, and a close or a verification cancelled while it stops its sandbox still
+stops it.
 
 ### Images and what a row needs
 

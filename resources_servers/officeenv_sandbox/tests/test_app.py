@@ -27,11 +27,12 @@ import threading
 import time
 import typing
 import zipfile
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import anyio
 import httpx
 import pytest
 import yaml
@@ -50,6 +51,7 @@ from nemo_gym.client import ServerClient
 from nemo_gym.core import EpisodeId, TaskId
 from nemo_gym.server_runtime import (
     NEMO_GYM_MCP_SESSION_TOKEN_HEADER,
+    ResourcesCloseSessionRequest,
     ResourcesSeedSessionRequest,
     check_resources_session_contract,
     maybe_auto_expose,
@@ -833,6 +835,101 @@ def test_shutdown_names_the_creates_still_in_flight_at_its_deadline_apart(sandbo
     assert "Shutdown left 2 OfficeEnv sandboxes running" in caplog.text
     assert "1 lent, sessions: rs-0." in caplog.text and "1 still starting" in caplog.text
     assert caplog.text.rstrip().endswith("sessions: rs-1")
+
+
+def as_a_request(handler: Callable[[], Awaitable[object]]) -> asyncio.Task:
+    """``handler`` run as Gym runs a route, in an anyio task group (ClientDisconnectCancellationMiddleware), in a task
+    of its own, as uvicorn runs a request. Cancelling the task, as uvicorn cancels the requests in flight 0.5 s into a
+    shutdown and a client's disconnect cancels its own, cancels every later await in the handler that is not
+    shielded."""
+
+    async def request() -> None:
+        async with anyio.create_task_group() as group:
+            group.start_soon(handler)
+
+    return asyncio.ensure_future(request())
+
+
+@pytest.mark.parametrize("shutting_down", [False, True], ids=["client_gave_up", "shutdown"])
+def test_a_seed_cancelled_as_its_sandbox_starts_stops_that_sandbox(
+    sandboxes, monkeypatch, caplog, shutting_down: bool
+) -> None:
+    """A seed whose request is cancelled while its sandbox starts still finishes the start, then stops the sandbox by
+    its id, logs it and lends nothing; a shutdown that began meanwhile waits for it. Before, the cancellation reached
+    the provider's create and the cleanup's unshielded stop alike, and neither the seed nor shutdown knew the sandbox
+    any more: a two-step training smoke ended with 8 sandboxes still running, as many as the requests uvicorn
+    cancelled, and no line naming them."""
+    monkeypatch.setattr(sandbox_app, "get_global_config_dict", lambda: GRACE_OF_3_S)  # a shutdown budget of 1 s
+    server = make_server()
+    start, stop = FakeSandbox.start, FakeSandbox.stop
+
+    async def scenario() -> None:
+        creating, created = asyncio.Event(), asyncio.Event()
+
+        async def slow_start(sandbox: FakeSandbox, spec) -> None:
+            creating.set()
+            await created.wait()  # the provider's create, in flight
+            await start(sandbox, spec)
+
+        async def provider_stop(sandbox: FakeSandbox) -> None:
+            await asyncio.sleep(0)  # a request to the provider, which a cancelled scope cuts
+            await stop(sandbox)
+
+        monkeypatch.setattr(FakeSandbox, "start", slow_start)
+        monkeypatch.setattr(FakeSandbox, "stop", provider_stop)
+        seed = as_a_request(lambda: server._seed_sandboxed_episode(SimpleNamespace(session={}), seed_request()))
+        await creating.wait()
+        seed.cancel()
+        await asyncio.sleep(0.05)  # the cancellation has reached the seed, whose start goes on
+        assert not seed.done() and server._starting == {"rs-1"}
+        shutdown = asyncio.ensure_future(server.shutdown()) if shutting_down else None
+        await asyncio.sleep(0.05)
+        assert shutdown is None or not shutdown.done()  # it waits for the seed still starting
+        created.set()
+        with pytest.raises(asyncio.CancelledError):
+            await seed
+        if shutdown is not None:
+            await shutdown
+
+    with caplog.at_level(logging.INFO):
+        asyncio.run(scenario())
+    (sandbox,) = sandboxes.started
+    assert sandboxes.stopped == [sandbox]
+    assert not server._episodes and not server._starting and not server._unstopped and not server._tokens
+    stopped = f"Sandbox {sandbox.sandbox_id} of OfficeEnv session rs-1 (task sandbox-files) stopped: its seed was"
+    assert stopped in caplog.text and "Shutdown left" not in caplog.text, caplog.text
+
+
+def test_a_close_cancelled_as_it_stops_the_sandbox_still_stops_it(sandboxes, monkeypatch) -> None:
+    """A close whose request is cancelled while it stops the episode's sandbox (a verification's stop, alike) still
+    stops it. Before, the stop was cancelled with the request, and the sandbox ran on until shutdown."""
+    server = make_server()
+
+    async def scenario() -> None:
+        await server._seed_sandboxed_episode(SimpleNamespace(session={}), seed_request())
+        stopping, stopped = asyncio.Event(), asyncio.Event()
+        stop = FakeSandbox.stop
+
+        async def slow_stop(sandbox: FakeSandbox) -> None:
+            stopping.set()
+            await stopped.wait()  # the provider's stop, in flight
+            await stop(sandbox)
+
+        monkeypatch.setattr(FakeSandbox, "stop", slow_stop)
+        caller = SimpleNamespace(client=SimpleNamespace(host="127.0.0.1"))
+        body = ResourcesCloseSessionRequest(**close_body())
+        close = as_a_request(lambda: server.close_resources_session(caller, body))
+        await stopping.wait()
+        close.cancel()
+        await asyncio.sleep(0.05)
+        assert not close.done()  # the stop goes on
+        stopped.set()
+        await asyncio.gather(close, return_exceptions=True)
+
+    asyncio.run(scenario())
+    (sandbox,) = sandboxes.started
+    assert sandboxes.stopped == [sandbox]
+    assert all(episode.sandbox is None for episode in server._episodes.values())
 
 
 # Seeds take turns.
